@@ -1,0 +1,17 @@
+Some other design inputs that have changed since the original program was created.
+
+1. Lee's section (I'll call Login) is going to read and time tag a user's entry and exit from the woodshop. The user places their rfid card on the Login reader upon entry to the woodshop to login and again to logout (they are automatically logged out at midnight if they failed to logout). The Login module sends a message to a server on my Pi (Server) over Ethernet (192.168.0.5) to port 45432 upon login or logout (one message for login, one message for logoug).
+
+2. The Login message contains a messageType (1 byte), timestamp (8 bytes), memberStatus (1 byte), memberID (4 bytes), firstName (20 bytes) and lastName (20 bytes). Upon message receipt Server a) updates its wall clock if necessary (deviation by more than 5 sec) and b) updates an active member table (memberStatus, memberID, firstName, lastName). MessageType is login or logout. Status is eligible or ineligible to use shop (e.g. hasn't paid dues). A login message adds a record. A logout message deletes a record from the active member table.
+
+3. Server still has a machineID file and a log file. The user file has been reduced to memberID and machine access bits. This is used for writing the rfid cards. We've added a table of members who are logged in. Someone who hasn't logged in cannot use any of the machines. The log file and machineID file remain unchanged.
+
+4. Server is no longer going to have a wwvb connection or a ds3231 module to keep track of time. Timing data will be provided through the message from the Login machine.
+
+5. Login and Server will read/write to separate sections of the rfid card. Hopefully, this will keep gremlins at bay when it comes to reading a card written by two separate writers. Server writes memberID and the 32 bytes of machine access data (access for 256 possible machines). The machine clients (one per machine) will compare memberID parameters from both sections to ensure that the cards haven't been tampered with.
+
+6. Login and Server are connected together via Ethernet.
+
+
+
+last line
