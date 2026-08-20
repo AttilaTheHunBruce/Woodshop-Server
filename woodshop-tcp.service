@@ -1,0 +1,15 @@
+[Unit]
+Description=Woodshop Master TCP Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/woodshop
+ExecStart=/home/pi/woodshop/venv/bin/python /home/pi/woodshop/master_server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
