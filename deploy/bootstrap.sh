@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-REPO_URL="${WOODSHOP_REPO_URL:-https://github.com/YOUR_USER/YOUR_REPO.git}"
+REPO_URL="${WOODSHOP_REPO_URL:-https://github.com/AttilaTheHunBruce/Woodshop-Server.git}"
 BRANCH="${WOODSHOP_BRANCH:-main}"
 APP_USER="dietpi"
 APP_HOME="/home/${APP_USER}/woodshop"
