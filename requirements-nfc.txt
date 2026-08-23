@@ -1,5 +1,0 @@
-# DEPRECATED -- delete this file, do not add it to the repo.
-#
-# The server no longer talks to any NFC/RFID hardware (PN532 or otherwise).
-# Card writing is done on Lee's machine with WriteNTAG215.py, outside this
-# project entirely. requirements.txt alone is all the server needs.
