@@ -298,8 +298,7 @@ NAV_AUTH = """
     <a href="/admin/users">Users</a>
     <a href="/admin/machines">Machines</a>
     <a href="/admin/renew">Renew</a>
-    <a href="/admin/ntp">NTP Sync</a>
-    <a href="/admin/config-card">Config Card</a>
+    <a href="/admin/diag">Diagnostics</a>
     <a href="/logout">Logout</a>
   </nav>
 </div>"""
@@ -527,20 +526,17 @@ def api_active():
 
 # ── Admin: Users — full management flow ───────────────────────────────────────
 #
-# Step 1:  /admin/users          — choose: Scan Card  OR  Search by name/ID
-# Step 2a: /admin/users/scan     — page polls /api/card_scan until master posts
-# Step 2b: /admin/users/search   — search form → results list
-# Step 3:  /admin/users/edit     — full edit form with permissions grid
-# Step 4:  POST /admin/users/save — write back to users.json
+# Step 1: /admin/users           — choose: List All  OR  Search by name/ID
+# Step 2: /admin/users/search    — search form → results list
+# Step 3: /admin/users/edit      — full edit form with permissions grid
+# Step 4: POST /admin/users/save — write back to users.json
 #
-# Card scan relay:
-#   The master Pico POSTs to  /api/card_present  when a card is scanned
-#   while the web UI is waiting.  The web UI polls /api/card_scan to pick it up.
+# Aug 2026: member-card RFID read/write/erase removed. Login/logout is now
+# handled entirely by Lee's system over the network (port 45432) — Server
+# no longer reads or writes member cards at all. The permissions grid here
+# still edits the reduced member file (memberID + machine access bits),
+# which is what gets looked up when a member logs in.
 # ─────────────────────────────────────────────────────────────────────────────
-
-# Volatile slot — holds the most-recently scanned card (one at a time)
-_pending_card: dict | None = None
-_pending_card_lock = threading.Lock()
 
 NUM_MACHINES     = 40   # number of machines shown in the permissions grid
 NUM_PERMS_STORED = 128  # full permission string length kept in storage
@@ -660,35 +656,6 @@ USERS_LANDING = """<!doctype html><html><head><title>Users – Woodshop</title>
   }}
   </script>
 
-  <!-- RFID Card Functions -->
-  <div class="card">
-    <h2>📡 RFID Card Functions</h2>
-    <div style="display:flex;gap:.8rem;flex-wrap:wrap">
-      <a href="/admin/users/scan" class="btn"
-         style="flex:1;text-align:center;padding:.75rem;font-size:.95rem">
-        📖 Read Card</a>
-      <a href="/admin/users/card-write" class="btn"
-         style="flex:1;text-align:center;padding:.75rem;font-size:.95rem;
-                background:#333;color:var(--text)">
-        ✍ Write Card</a>
-      <a href="/admin/users/card-erase" class="btn"
-         style="flex:1;text-align:center;padding:.75rem;font-size:.95rem;
-                background:#5a1a1a;color:#ef9a9a">
-        🗑 Erase Card</a>
-    </div>
-    <div style="display:flex;gap:.8rem;flex-wrap:wrap;margin-top:.5rem">
-      <a href="/admin/config-card" class="btn"
-         style="flex:1;text-align:center;padding:.75rem;font-size:.95rem;
-                background:#1a3a5a;color:#90caf9">
-        ⚙ Write Config Card</a>
-    </div>
-    <p style="font-size:.8rem;color:var(--muted);margin-top:.6rem">
-      Read: scan any card to view/edit the matched user record.<br>
-      Write: choose a user from the database and program a card.<br>
-      Erase: wipe all user data from a card.<br>
-      Config Card: program a node's machine number and blast gate delay.
-    </p>
-  </div>
 
 </div></body></html>"""
 
@@ -851,8 +818,6 @@ def admin_users_list():
             f'<td><span class="status-{css}">{label}</span></td>'
             f'<td style="white-space:nowrap">'
             f'<a href="/admin/users/edit?uid={uid}" class="btn btn-sm">Edit</a> '
-            f'<a href="/admin/users/card-write?uid={uid}" class="btn btn-sm"'
-            f'   style="background:#333;color:var(--text)">Write Card</a> '
             f'<button class="btn btn-sm btn-danger"'
             f'  onclick="deleteUser(\'{uid}\',\'{name}\')">Delete</button>'
             f'</td>'
@@ -886,571 +851,6 @@ def api_users_export():
         ])
     return Response(output.getvalue(), mimetype='text/csv',
         headers={"Content-Disposition": "attachment; filename=woodshop_users.csv"})
-
-# ── RFID card write/erase (Pi-local PN532 via server_card_writer) ─────────────
-#
-# Architecture: write/erase runs in a background thread on the Pi using the
-# same PN532 hardware and server_card_writer module as rfid_writer.py.
-# The web UI starts the job, then polls /api/card_op_status for completion.
-#
-# /admin/users/card-write?uid=NNN  — confirm page for a specific user, or
-# /admin/users/card-write           — search page to pick a user
-# /admin/users/card-erase           — erase confirmation page
-# POST /api/card_op_start           — starts background write or erase thread
-# GET  /api/card_op_status          — polled by UI: idle|waiting|writing|done|error
-
-_card_op_status = {"state": "idle", "message": ""}
-_card_op_lock   = threading.Lock()
-
-def _card_op_set(state, message=""):
-    with _card_op_lock:
-        _card_op_status["state"]   = state
-        _card_op_status["message"] = message
-
-def _run_card_write(uid_int, p0, p1, p2, p3, firstname, lastname):
-    """Background thread: write card data using PN532 on the Pi."""
-    try:
-        from server_card_writer import create_card_data, CARD_LEN
-        import board, busio, digitalio
-        from adafruit_pn532.spi import PN532_SPI
-
-        private_key = _load_card_private_key()
-        if private_key is None:
-            _card_op_set("error", "Private key not found")
-            return
-
-        spi   = busio.SPI(board.SCK, board.MOSI, board.MISO)
-        cs    = digitalio.DigitalInOut(board.CE0)
-        pn532 = PN532_SPI(spi, cs, debug=False)
-        pn532.SAM_configuration()
-
-        card_bytes = create_card_data(uid_int, p0, p1, p2, p3, firstname, lastname, private_key)
-        _card_op_set("waiting", "Place card on reader…")
-
-        # Wait up to 60s for a card
-        import time
-        deadline = time.time() + 60
-        card_uid = None
-        while time.time() < deadline:
-            card_uid = pn532.read_passive_target(timeout=0.5)
-            if card_uid:
-                break
-        if not card_uid:
-            _card_op_set("error", "Timed out waiting for card (60s)")
-            return
-
-        _card_op_set("writing", "Writing…")
-        pages = CARD_LEN // 4
-        for i in range(pages):
-            page = 4 + i   # PAGE_DATA_START = 4
-            pn532.ntag2xx_write_block(page, card_bytes[i*4:(i+1)*4])
-            time.sleep(0.01)
-
-        _card_op_set("done", f"Card written for member {uid_int}")
-
-    except Exception as e:
-        _card_op_set("error", str(e))
-
-def _run_card_erase():
-    """Background thread: erase card data using PN532 on the Pi."""
-    try:
-        import board, busio, digitalio
-        from adafruit_pn532.spi import PN532_SPI
-        import time
-
-        spi   = busio.SPI(board.SCK, board.MOSI, board.MISO)
-        cs    = digitalio.DigitalInOut(board.CE0)
-        pn532 = PN532_SPI(spi, cs, debug=False)
-        pn532.SAM_configuration()
-
-        _card_op_set("waiting", "Place card on reader…")
-        deadline = time.time() + 60
-        card_uid = None
-        while time.time() < deadline:
-            card_uid = pn532.read_passive_target(timeout=0.5)
-            if card_uid:
-                break
-        if not card_uid:
-            _card_op_set("error", "Timed out waiting for card (60s)")
-            return
-
-        _card_op_set("writing", "Erasing…")
-        # Erase 29 pages (116 bytes) starting at page 4
-        from server_card_writer import CARD_LEN
-        pages = CARD_LEN // 4
-        for page in range(4, 4 + pages):
-            pn532.ntag2xx_write_block(page, b'\x00\x00\x00\x00')
-            time.sleep(0.01)
-
-        _card_op_set("done", "Card erased")
-
-    except Exception as e:
-        _card_op_set("error", str(e))
-
-PRIVATE_KEY_PATH = '/home/pi/woodshop/server_private.pem'
-
-def _load_card_private_key():
-    try:
-        from server_card_writer import load_private_key
-        return load_private_key(PRIVATE_KEY_PATH)
-    except Exception:
-        return None
-
-# ── Card write: confirm page ───────────────────────────────────────────────────
-
-CARD_WRITE_SEARCH_PAGE = """<!doctype html><html><head>
-<title>Write RFID Card – Woodshop</title>{style}</head><body>
-{nav}
-<div class="container" style="max-width:540px">
-  <div class="card">
-    <h2>✍ Write RFID Card</h2>
-    <p style="color:var(--muted);font-size:.85rem;margin-bottom:.8rem">
-      Search for the user whose data you want to write to a card.</p>
-    <form method="GET" action="/admin/users/card-write">
-      <label>Search by name or member ID</label>
-      <div style="display:flex;gap:.5rem">
-        <input name="q" value="{q}" placeholder="e.g. Alice  or  1234" style="margin:0">
-        <button type="submit" style="flex-shrink:0">Search</button>
-      </div>
-    </form>
-    {results}
-  </div>
-  <a href="/admin/users" class="btn btn-sm"
-     style="background:#333;color:var(--text)">← Back</a>
-</div></body></html>"""
-
-CARD_WRITE_CONFIRM_PAGE = """<!doctype html><html><head>
-<title>Write RFID Card – Woodshop</title>{style}</head><body>
-{nav}
-<div class="container" style="max-width:500px">
-  <div class="card">
-    <h2>✍ Write Card — {name}</h2>
-    <p style="color:var(--muted);font-size:.85rem;margin-bottom:.8rem">
-      Data to be written to card:</p>
-    <table style="margin-bottom:.8rem">
-      <tr><th style="width:40%">Member ID</th><td>{uid}</td></tr>
-      <tr><th>Name</th><td>{name}</td></tr>
-      <tr><th>Expiry</th><td>{expiry}</td></tr>
-      <tr><th>Machines enabled</th><td>{enabled} of {total}</td></tr>
-      <tr><th>Permissions</th>
-          <td style="font-family:monospace;font-size:.72rem;word-break:break-all">
-            {perms_display}</td></tr>
-    </table>
-
-    <div id="opStatus" style="display:none;text-align:center;padding:1rem 0">
-      <div id="opIcon" style="font-size:2.5rem">⏳</div>
-      <div id="opMsg"  style="color:var(--muted);margin-top:.4rem;font-size:.9rem">
-        Starting…</div>
-    </div>
-
-    <div id="opActions" style="display:flex;gap:.5rem;flex-wrap:wrap">
-      <button id="startBtn" onclick="startOp()">📡 Start — Place Card on Reader</button>
-      <a href="/admin/users/card-write" class="btn"
-         style="background:#333;color:var(--text)">Cancel</a>
-    </div>
-  </div>
-</div>
-<script>
-function setUI(icon, msg) {{
-  document.getElementById('opIcon').textContent = icon;
-  document.getElementById('opMsg').textContent  = msg;
-}}
-function startOp() {{
-  document.getElementById('startBtn').disabled = true;
-  document.getElementById('opStatus').style.display = 'block';
-  setUI('⏳', 'Starting…');
-  fetch('/api/card_op_start', {{
-    method: 'POST',
-    headers: {{'Content-Type':'application/json'}},
-    body: JSON.stringify({{op:'write', uid:'{uid}'}})
-  }}).then(r=>r.json()).then(d=>{{
-    if (d.ok) poll();
-    else setUI('❌', 'Error: '+(d.error||'unknown'));
-  }}).catch(()=>setUI('❌','Network error'));
-}}
-async function poll() {{
-  try {{
-    const d = await (await fetch('/api/card_op_status')).json();
-    if (d.state==='waiting') {{ setUI('📡', d.message); setTimeout(poll,800); }}
-    else if (d.state==='writing') {{ setUI('✏️', d.message); setTimeout(poll,600); }}
-    else if (d.state==='done') {{
-      setUI('✅', d.message);
-      document.getElementById('opActions').innerHTML =
-        '<a href="/admin/users/list" class="btn">Done</a>'
-        +'<a href="/admin/users/card-write" class="btn" style="background:#333;color:var(--text)">Write Another</a>';
-    }} else if (d.state==='error') {{
-      setUI('❌', 'Error: '+d.message);
-      document.getElementById('startBtn').disabled=false;
-    }} else {{ setTimeout(poll,1000); }}
-  }} catch(e) {{ setTimeout(poll,1200); }}
-}}
-</script>
-</body></html>"""
-
-CARD_ERASE_PAGE = """<!doctype html><html><head>
-<title>Erase RFID Card – Woodshop</title>{style}</head><body>
-{nav}
-<div class="container" style="max-width:500px">
-  <div class="card">
-    <h2>🗑 Erase RFID Card</h2>
-    <p style="color:#ef9a9a;font-size:.9rem;margin-bottom:1rem">
-      ⚠ This will permanently wipe all user data from the card.</p>
-
-    <div id="opStatus" style="display:none;text-align:center;padding:1rem 0">
-      <div id="opIcon" style="font-size:2.5rem">⏳</div>
-      <div id="opMsg"  style="color:var(--muted);margin-top:.4rem;font-size:.9rem">
-        Starting…</div>
-    </div>
-
-    <div id="opActions" style="display:flex;gap:.5rem;flex-wrap:wrap">
-      <button id="startBtn" class="btn btn-danger" onclick="startOp()">
-        🗑 Erase — Place Card on Reader</button>
-      <a href="/admin/users" class="btn"
-         style="background:#333;color:var(--text)">Cancel</a>
-    </div>
-  </div>
-</div>
-<script>
-function setUI(icon,msg){{
-  document.getElementById('opIcon').textContent=icon;
-  document.getElementById('opMsg').textContent=msg;
-}}
-function startOp(){{
-  document.getElementById('startBtn').disabled=true;
-  document.getElementById('opStatus').style.display='block';
-  setUI('⏳','Starting…');
-  fetch('/api/card_op_start',{{
-    method:'POST',
-    headers:{{'Content-Type':'application/json'}},
-    body:JSON.stringify({{op:'erase'}})
-  }}).then(r=>r.json()).then(d=>{{
-    if(d.ok) poll();
-    else setUI('❌','Error: '+(d.error||'unknown'));
-  }}).catch(()=>setUI('❌','Network error'));
-}}
-async function poll(){{
-  try{{
-    const d=await(await fetch('/api/card_op_status')).json();
-    if(d.state==='waiting'){{setUI('📡',d.message);setTimeout(poll,800);}}
-    else if(d.state==='writing'){{setUI('✏️',d.message);setTimeout(poll,600);}}
-    else if(d.state==='done'){{
-      setUI('✅',d.message);
-      document.getElementById('opActions').innerHTML=
-        '<a href="/admin/users" class="btn">Done</a>'
-        +'<a href="/admin/users/card-erase" class="btn" style="background:#333;color:var(--text)">Erase Another</a>';
-    }}else if(d.state==='error'){{
-      setUI('❌','Error: '+d.message);
-      document.getElementById('startBtn').disabled=false;
-    }}else{{setTimeout(poll,1000);}}
-  }}catch(e){{setTimeout(poll,1200);}}
-}}
-</script>
-</body></html>"""
-
-@app.route("/admin/users/card-write")
-@login_required
-def admin_card_write():
-    uid = request.args.get("uid","").strip()
-    q   = request.args.get("q","").strip()
-
-    # Direct link with uid (e.g. from user list) — show confirm page immediately
-    if uid:
-        user = _find_user(uid)
-        if not user:
-            return redirect(url_for('admin_card_write', msg="User not found"))
-        return _card_write_confirm(user)
-
-    # Search results
-    results_html = ""
-    if q:
-        hits = _search_users(q)
-        if hits:
-            rows = "".join(
-                "<tr>"
-                f"<td>{u.get('id','')}</td>"
-                f"<td>{u.get('first_name','')} {u.get('last_name','')}</td>"
-                f"<td><a href='/admin/users/card-write?uid={u.get('id','')}'"
-                "   class='btn btn-sm'>Select</a></td>"
-                "</tr>"
-                for u in hits
-            )
-            results_html = (
-                '<div style="margin-top:.8rem"><table>'
-                '<thead><tr><th>ID</th><th>Name</th><th></th></tr></thead>'
-                f'<tbody>{rows}</tbody></table></div>'
-            )
-        else:
-            results_html = f'<p class="empty" style="margin-top:.6rem">No users match "{q}".</p>'
-
-    return CARD_WRITE_SEARCH_PAGE.format(
-        style=COMMON_STYLE, nav=NAV_AUTH.format(app_version=__version__), q=q, results=results_html
-    )
-
-def _card_write_confirm(user):
-    """Render the write confirmation page for a given user dict."""
-    from server_card_writer import perms_str_to_words, perms_to_machines
-    uid    = user.get('id','')
-    name   = f"{user.get('first_name','')} {user.get('last_name','')}".strip()
-    expiry = user.get('expiry', default_expiry_date())
-    perms  = user.get('permissions','0'*128)
-    try:
-        p0, p1, p2, p3 = perms_str_to_words(perms)
-        machines        = perms_to_machines(p0, p1, p2, p3)
-        enabled         = len(machines)
-    except Exception:
-        enabled = sum(1 for c in perms if c == '1')
-    perms_short = perms[:40] + ('…' if len(perms) > 40 else '')
-    return CARD_WRITE_CONFIRM_PAGE.format(
-        style=COMMON_STYLE, nav=NAV_AUTH.format(app_version=__version__),
-        uid=uid, name=name, expiry=expiry,
-        perms_display=perms_short,
-        enabled=enabled, total=NUM_MACHINES
-    )
-
-@app.route("/admin/users/card-erase")
-@login_required
-def admin_card_erase():
-    return CARD_ERASE_PAGE.format(style=COMMON_STYLE, nav=NAV_AUTH.format(app_version=__version__))
-
-@app.route("/api/card_op_start", methods=["POST"])
-@login_required
-def api_card_op_start():
-    """Start a background card write or erase operation."""
-    global _card_op_status
-    with _card_op_lock:
-        if _card_op_status["state"] in ("waiting","writing"):
-            return jsonify({"error": "operation already in progress"}), 409
-
-    data = request.get_json(silent=True) or {}
-    op   = data.get("op","")
-
-    if op == "write":
-        uid_str = str(data.get("uid","")).strip()
-        user    = _find_user(uid_str)
-        if not user:
-            return jsonify({"error": "user not found"}), 404
-        try:
-            from server_card_writer import perms_str_to_words
-            perms = user.get('permissions','0'*128)
-            p0, p1, p2, p3 = perms_str_to_words(perms)
-        except Exception as e:
-            return jsonify({"error": f"permissions error: {e}"}), 400
-        uid_int   = int(user.get('id', 0))
-        firstname = user.get('first_name', '').strip()
-        lastname  = user.get('last_name',  '').strip()
-        _card_op_set("starting", "")
-        t = threading.Thread(target=_run_card_write,
-                             args=(uid_int, p0, p1, p2, p3, firstname, lastname), daemon=True)
-        t.start()
-        return jsonify({"ok": True})
-
-    elif op == "erase":
-        _card_op_set("starting", "")
-        t = threading.Thread(target=_run_card_erase, daemon=True)
-        t.start()
-        return jsonify({"ok": True})
-
-    return jsonify({"error": "unknown op"}), 400
-
-@app.route("/api/card_op_status")
-@login_required
-def api_card_op_status():
-    with _card_op_lock:
-        return jsonify(dict(_card_op_status))
-
-# ── Step 2a: scan card (local PN532) ─────────────────────────────────────────
-
-SCAN_PAGE = """<!doctype html><html><head><title>Read Card – Woodshop</title>
-{style}</head><body>
-{nav}
-<div class="container" style="max-width:420px">
-  <div class="card" style="margin-top:2rem;text-align:center">
-    <h2>📡 Read RFID Card</h2>
-    <p style="color:var(--muted);font-size:.9rem;margin:.6rem 0 1.2rem">
-      Place the card on the Pi's PN532 reader.</p>
-    <div id="spinner" style="font-size:2.5rem;margin:1rem 0">📡</div>
-    <div id="status" style="color:var(--muted);font-size:.9rem">Waiting for card…</div>
-    <div style="margin-top:1.2rem">
-      <a href="/admin/users" class="btn btn-sm"
-         style="background:#333;color:var(--text)">Cancel</a>
-    </div>
-  </div>
-</div>
-<script>
-async function poll() {{
-  try {{
-    const r = await fetch('/api/card_scan');
-    const d = await r.json();
-    if (d.state === 'done' && d.uid) {{
-      document.getElementById('spinner').textContent = '✔';
-      document.getElementById('status').textContent = d.message;
-      if (d.card_type === 'config') {{
-        // Config card — just show the result, no redirect
-        document.getElementById('spinner').textContent = '⚙';
-      }} else if (d.member_id) {{
-        window.location = '/admin/users/edit?uid=' + encodeURIComponent(d.member_id) + '&mode=db';
-      }} else {{
-        window.location = '/admin/users/edit?rfid=' + encodeURIComponent(d.uid) + '&mode=card';
-      }}
-      return;
-    }} else if (d.state === 'error') {{
-      document.getElementById('spinner').textContent = '❌';
-      document.getElementById('status').textContent = 'Error: ' + d.message;
-      return;
-    }}
-  }} catch(e) {{}}
-  setTimeout(poll, 800);
-}}
-poll();
-</script>
-</body></html>"""
-
-# ── Local PN532 scan state ────────────────────────────────────────────────────
-
-_scan_status  = {"state": "idle", "message": "", "uid": "", "member_id": "", "card_type": ""}
-_scan_lock    = threading.Lock()
-_scan_running = False
-
-def _scan_op_set(state, message="", uid="", member_id="", card_type=""):
-    with _scan_lock:
-        _scan_status["state"]     = state
-        _scan_status["message"]   = message
-        _scan_status["uid"]       = uid
-        _scan_status["member_id"] = member_id
-        _scan_status["card_type"] = card_type
-
-def _run_card_scan():
-    """Background thread: read a card from the Pi's local PN532 and decode it."""
-    global _scan_running
-    try:
-        import board, busio, digitalio, time, struct
-        from adafruit_pn532.spi import PN532_SPI
-        from server_card_writer import PAYLOAD_FORMAT, PAYLOAD_LEN, CARD_LEN
-
-        spi   = busio.SPI(board.SCK, board.MOSI, board.MISO)
-        cs    = digitalio.DigitalInOut(board.CE0)
-        pn532 = PN532_SPI(spi, cs, debug=False)
-        pn532.SAM_configuration()
-
-        _scan_op_set("waiting", "Place card on reader…")
-
-        deadline = time.time() + 60
-        raw_uid  = None
-        while time.time() < deadline:
-            raw_uid = pn532.read_passive_target(timeout=0.5)
-            if raw_uid:
-                break
-        if not raw_uid:
-            _scan_op_set("error", "Timed out waiting for card (60s)")
-            return
-
-        uid_hex = raw_uid.hex().upper()
-
-        data = bytearray()
-        for i in range(CARD_LEN // 4):
-            page  = 4 + i
-            chunk = None
-            for _ in range(3):
-                try:
-                    chunk = pn532.ntag2xx_read_block(page)
-                    if chunk is not None:
-                        break
-                except Exception:
-                    pass
-                time.sleep(0.02)
-            if chunk is None:
-                _scan_op_set("error", f"Read failed on page {page}")
-                return
-            data.extend(chunk[:4])
-            time.sleep(0.01)
-
-        card_bytes = bytes(data)
-
-        if all(b == 0 for b in card_bytes):
-            _scan_op_set("done", "Blank card", uid=uid_hex, member_id="")
-            return
-
-        try:
-            card_type = card_bytes[0]
-            card_ver  = card_bytes[1]
-
-            if card_type == 0x02:
-                # Config card — decode the 5-byte signed payload
-                machine_num = card_bytes[2]
-                blast_raw   = card_bytes[3] & 0x0F
-                _scan_op_set("done",
-                             f"Config card v{card_ver}: machine={machine_num}, "
-                             f"blast gate={blast_raw * 10}s",
-                             uid=uid_hex, member_id="", card_type="config")
-                return
-
-            if card_type == 0x01:
-                # Member card — decode using server_card_writer format
-                from server_card_writer import PAYLOAD_FORMAT, PAYLOAD_LEN
-                payload = card_bytes[:PAYLOAD_LEN]
-                card_type, version, member_id, p0, p1, p2, p3, fn_raw, ln_raw = \
-                    struct.unpack(PAYLOAD_FORMAT, payload)
-                if version != 0x01:
-                    _scan_op_set("done",
-                                 f"Unsupported member card version (v{version})",
-                                 uid=uid_hex, member_id="", card_type="member")
-                    return
-                def _dn(b):
-                    try: b = b[:b.index(0)]
-                    except ValueError: pass
-                    return b.decode("utf-8", errors="replace")
-                firstname = _dn(fn_raw)
-                lastname  = _dn(ln_raw)
-                _scan_op_set("done",
-                             f"Member {member_id}: {firstname} {lastname}",
-                             uid=uid_hex,
-                             member_id=str(member_id),
-                             card_type="member")
-                return
-
-            # Unknown card type
-            _scan_op_set("done",
-                         f"Unknown card type 0x{card_type:02X}",
-                         uid=uid_hex, member_id="", card_type="unknown")
-
-        except Exception as e:
-            _scan_op_set("done", f"Could not decode: {e}", uid=uid_hex, member_id="")
-
-    except Exception as e:
-        _scan_op_set("error", str(e))
-    finally:
-        _scan_running = False
-
-
-@app.route("/admin/users/scan")
-@login_required
-def admin_users_scan():
-    global _scan_running, _scan_status
-    with _scan_lock:
-        _scan_status  = {"state": "starting", "message": "", "uid": "", "member_id": ""}
-        _scan_running = True
-    t = threading.Thread(target=_run_card_scan, daemon=True)
-    t.start()
-    return SCAN_PAGE.format(style=COMMON_STYLE, nav=NAV_AUTH.format(app_version=__version__))
-
-
-@app.route("/api/card_scan")
-@login_required
-def api_card_scan():
-    """Polled by the scan page. Returns current scan state."""
-    with _scan_lock:
-        return jsonify(dict(_scan_status))
-
-
-# ESP32 machines may post card UIDs here (kept for future use)
-@app.route("/api/card_present", methods=["POST"])
-def api_card_present():
-    """Called by ESP32 when a card is scanned. No login required."""
-    data = request.get_json(silent=True) or request.form
-    rfid = str(data.get("rfid", "")).strip().upper()
-    if not rfid:
-        return jsonify({"error": "no rfid"}), 400
-    return jsonify({"ok": True})
 
 # ── Step 2b: search ───────────────────────────────────────────────────────────
 
@@ -1687,7 +1087,7 @@ function deleteUser() {{
 @app.route("/admin/users/edit")
 @login_required
 def admin_users_edit():
-    mode = request.args.get("mode", "db")   # new | card | db
+    mode = request.args.get("mode", "db")   # new | db
     rfid = request.args.get("rfid", "").strip().upper()
     uid  = request.args.get("uid", "").strip()
     machines = load_json(MACHINES_FILE, [])
@@ -1695,21 +1095,7 @@ def admin_users_edit():
     user = {}
     flash_html = ""
 
-    if mode == "card" and rfid:
-        # Try to find user in DB by RFID UID
-        users = load_json(USERS_FILE, [])
-        matched = next((u for u in users
-                        if str(u.get("rfid","")).upper() == rfid), None)
-        if matched:
-            user = matched
-            flash_html = f'<div class="flash">Card {rfid} matched to {user.get("first_name","")} {user.get("last_name","")}. Editing existing record.</div>'
-            mode = "db"
-        else:
-            # New card not in database
-            user = {"rfid": rfid, "active": True, "permissions": "0" * NUM_MACHINES}
-            flash_html = f'<div class="flash">Card {rfid} not found in database — creating new user.</div>'
-            mode = "new"
-    elif uid:
+    if uid:
         user = _find_user(uid) or {}
         if not user:
             flash_html = '<div class="flash error">User not found.</div>'
@@ -2159,558 +1545,39 @@ def admin_password():
             flash_html = '<div class="flash">✔ Password updated.</div>'
     return PASSWD_PAGE.format(style=COMMON_STYLE, nav=NAV_AUTH.format(app_version=__version__), flash=flash_html)
 
-# ── Admin: NTP Sync ───────────────────────────────────────────────────────────
-#
-# Workflow:
-#   1. User connects phone/tablet hotspot → Pi joins it (wpa_supplicant call)
-#   2. Pi queries pool.ntp.org for current UTC time
-#   3. Python writes the time to the DS3231 via I2C (smbus2)
-#   4. Result displayed on-screen with before/after timestamps
-#
-# DS3231 I2C address is 0x68; we write directly with smbus2 so there's
-# no Arduino dependency.  Install with: pip install smbus2
-#
-# All long operations (WiFi join, NTP query, RTC write) run in a background
-# thread and stream status via the /admin/ntp/status JSON endpoint so the
-# page can poll without timing out.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Thread-safe status log for the NTP operation
-_ntp_log: list[str] = []
-_ntp_running = False
-_ntp_lock    = threading.Lock()
-
-DS3231_I2C_BUS  = 1      # /dev/i2c-1 on Pi (change to 0 for older Pi rev)
-DS3231_ADDRESS  = 0x68
-UTC_OFFSET_FILE = os.path.join(BASE_DIR, "data", "utc_offset.json")  # persists TZ choice
-
-def _log(msg: str):
-    ts = datetime.now().strftime("%H:%M:%S")
-    with _ntp_lock:
-        _ntp_log.append(f"[{ts}] {msg}")
-
-def _bcd(n: int) -> int:
-    return (n // 10) << 4 | (n % 10)
-
-def _write_ds3231(dt: datetime):
-    """Write datetime to DS3231 over I2C using smbus2."""
-    try:
-        import smbus2
-        bus = smbus2.SMBus(DS3231_I2C_BUS)
-        # Registers 0x00–0x06: sec, min, hr, dow, date, mon, yr (all BCD)
-        bus.write_i2c_block_data(DS3231_ADDRESS, 0x00, [
-            _bcd(dt.second),
-            _bcd(dt.minute),
-            _bcd(dt.hour),
-            _bcd(dt.weekday() + 1),   # DS3231 day-of-week 1–7
-            _bcd(dt.day),
-            _bcd(dt.month),
-            _bcd(dt.year % 100)
-        ])
-        bus.close()
-        return True, None
-    except ImportError:
-        return False, "smbus2 not installed (pip install smbus2)"
-    except Exception as e:
-        return False, str(e)
-
-def _get_ntp_time(server: str = "pool.ntp.org") -> float | None:
-    """Raw NTP query — no external library needed."""
-    packet = b'\x1b' + 47 * b'\0'
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.settimeout(10)
-            s.sendto(packet, (server, 123))
-            data, _ = s.recvfrom(1024)
-        ts = struct.unpack('!I', data[40:44])[0]
-        return ts - 2208988800  # NTP epoch → Unix epoch
-    except Exception as e:
-        _log(f"NTP query failed: {e}")
-        return None
-
-# Name of the main shop WiFi connection to restore after hotspot sync
-SHOP_CONNECTION = "netplan-wlan0-BigHippo"
-
-def _join_wifi(ssid: str, password: str) -> bool:
-    """
-    Connect to a WiFi hotspot using nmcli (Pi OS Bookworm/NetworkManager).
-    Creates a fresh connection profile with explicit WPA-PSK security.
-    Requires root privileges (service runs as root).
-    """
-    try:
-        # Delete any stale profile with same name
-        subprocess.run(["nmcli", "connection", "delete", ssid],
-                       capture_output=True, timeout=10)
-        # Create fresh profile with explicit WPA-PSK
-        r = subprocess.run(
-            ["nmcli", "connection", "add",
-             "type", "wifi",
-             "con-name", ssid,
-             "ssid", ssid,
-             "wifi-sec.key-mgmt", "wpa-psk",
-             "wifi-sec.psk", password],
-            capture_output=True, text=True, timeout=30
-        )
-        if r.returncode != 0:
-            _log(f"nmcli add failed: {r.stderr.strip()}")
-            return False
-        r2 = subprocess.run(
-            ["nmcli", "connection", "up", ssid],
-            capture_output=True, text=True, timeout=30
-        )
-        if r2.returncode == 0:
-            _log(f"nmcli: connected to '{ssid}'")
-            return True
-        _log(f"nmcli connect failed: {r2.stderr.strip()}")
-        return False
-    except Exception as e:
-        _log(f"nmcli error: {e}")
-        return False
-
-def _restore_wifi() -> None:
-    """Reconnect to the main shop WiFi after hotspot sync."""
-    import time
-    _log(f"Reconnecting to shop WiFi ({SHOP_CONNECTION}) …")
-    # Delete the temporary hotspot profile
-    subprocess.run(["nmcli", "connection", "delete", "hotspot-ntp-temp"],
-                   capture_output=True, timeout=10)
-    time.sleep(2)
-    r = subprocess.run(
-        ["nmcli", "connection", "up", SHOP_CONNECTION],
-        capture_output=True, text=True, timeout=30
-    )
-    if r.returncode == 0:
-        _log("✔ Reconnected to shop WiFi")
-    else:
-        _log(f"WARNING: Could not reconnect to shop WiFi: {r.stderr.strip()}")
-
-def _ntp_sync_worker(ssid: str, password: str, utc_offset: int,
-                     ntp_server: str, skip_wifi: bool):
-    global _ntp_running
-    hotspot_connected = False
-    try:
-        _log("── NTP sync started ──")
-
-        if not skip_wifi:
-            _log(f"Connecting to hotspot '{ssid}' …")
-            if not _join_wifi(ssid, password):
-                _log("ERROR: Could not connect to hotspot. Aborting.")
-                return
-            hotspot_connected = True
-            import time; time.sleep(3)
-            _log("WiFi connected. Waiting for DHCP …")
-            time.sleep(2)
-        else:
-            _log("Skipping WiFi step (already connected).")
-
-        _log(f"Querying {ntp_server} …")
-        unix_ts = _get_ntp_time(ntp_server)
-        if unix_ts is None:
-            _log("ERROR: NTP query returned no result.")
-            return
-
-        utc_dt = datetime.utcfromtimestamp(unix_ts)
-        local_dt = datetime.fromtimestamp(unix_ts + utc_offset * 3600)
-        _log(f"NTP UTC time : {utc_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-        _log(f"Local time   : {local_dt.strftime('%Y-%m-%d %H:%M:%S')} "
-             f"(UTC{utc_offset:+d})")
-
-        _log("Writing to DS3231 …")
-        ok, err = _write_ds3231(local_dt)
-        if ok:
-            _log(f"✔ DS3231 updated to {local_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-        else:
-            _log(f"ERROR writing DS3231: {err}")
-
-        # Persist UTC offset so next open of the page pre-fills it
-        save_json(UTC_OFFSET_FILE, {"utc_offset": utc_offset})
-
-    except Exception as e:
-        _log(f"Unexpected error: {e}")
-    finally:
-        # Always reconnect to shop WiFi if we switched away
-        if hotspot_connected:
-            _restore_wifi()
-        _ntp_running = False
-        _log("── Done ──")
-
-NTP_PAGE = """<!doctype html><html><head><title>NTP Sync – Woodshop</title>
-{style}
-<style>
-  #log-box{{background:#111;border:1px solid var(--border);border-radius:4px;
-            padding:.6rem;font-family:monospace;font-size:.82rem;min-height:80px;
-            max-height:260px;overflow-y:auto;color:#8bc34a;margin-top:.6rem}}
-  .row2{{display:flex;gap:.6rem}}
-  .row2>div{{flex:1}}
-</style>
-</head><body>
-{nav}
-<div class="container" style="max-width:500px">
-  <div class="card">
-    <h2>📡 NTP Time Sync → DS3231</h2>
-    <p style="font-size:.83rem;color:var(--muted);margin-bottom:.8rem">
-      Connect the Pi to your phone/tablet hotspot, then sync the RTC from the
-      internet. The hotspot must have internet access.
-    </p>
-    {flash}
-    <form id="syncForm">
-      <label>Hotspot SSID</label>
-      <input id="ssid" name="ssid" placeholder="MyPhone" value="{last_ssid}">
-      <label>Hotspot Password</label>
-      <input id="pw" name="password" type="password" placeholder="hotspot password">
-      <label>NTP Server</label>
-      <input id="ntp" name="ntp_server" value="pool.ntp.org">
-      <div class="row2">
-        <div>
-          <label>UTC Offset (hours)</label>
-          <input id="utc" name="utc_offset" type="number" min="-12" max="14"
-                 value="{utc_offset}" style="width:80px">
-        </div>
-        <div style="display:flex;align-items:flex-end;padding-bottom:.75rem">
-          <label style="display:flex;gap:.4rem;align-items:center;margin:0">
-            <input type="checkbox" id="skipWifi" name="skip_wifi" style="width:auto;margin:0">
-            Already on correct WiFi
-          </label>
-        </div>
-      </div>
-      <button type="submit" id="syncBtn">🔄 Sync Now</button>
-    </form>
-    <div id="log-box">Ready.</div>
-  </div>
-</div>
-
-<script>
-const form = document.getElementById('syncForm');
-const btn  = document.getElementById('syncBtn');
-const log  = document.getElementById('log-box');
-let polling = false;
-
-async function pollStatus() {{
-  try {{
-    const r = await fetch('/admin/ntp/status');
-    const d = await r.json();
-    log.textContent = d.log.join('\\n');
-    log.scrollTop = log.scrollHeight;
-    if (d.running) {{
-      setTimeout(pollStatus, 1000);
-    }} else {{
-      btn.disabled = false;
-      btn.textContent = '🔄 Sync Now';
-      polling = false;
-    }}
-  }} catch(e) {{
-    setTimeout(pollStatus, 2000);
-  }}
-}}
-
-form.addEventListener('submit', async (e) => {{
-  e.preventDefault();
-  if (polling) return;
-  btn.disabled = true;
-  btn.textContent = 'Syncing …';
-  log.textContent = 'Starting …';
-  polling = true;
-
-  const body = new URLSearchParams({{
-    ssid:       document.getElementById('ssid').value,
-    password:   document.getElementById('pw').value,
-    ntp_server: document.getElementById('ntp').value,
-    utc_offset: document.getElementById('utc').value,
-    skip_wifi:  document.getElementById('skipWifi').checked ? '1' : '0'
-  }});
-
-  try {{
-    await fetch('/admin/ntp/run', {{method:'POST', body}});
-  }} catch(e) {{}}  // response may not arrive if WiFi drops
-  setTimeout(pollStatus, 1500);
-}});
-</script>
-</body></html>"""
-
-@app.route("/admin/ntp", methods=["GET"])
-@login_required
-def admin_ntp():
-    saved = load_json(UTC_OFFSET_FILE, {})
-    return NTP_PAGE.format(
-        style    = COMMON_STYLE,
-        nav      = NAV_AUTH.format(app_version=__version__),
-        flash    = "",
-        last_ssid= "",
-        utc_offset = saved.get("utc_offset", -5)
-    )
-
-@app.route("/admin/ntp/run", methods=["POST"])
-@login_required
-def admin_ntp_run():
-    global _ntp_running, _ntp_log
-    if _ntp_running:
-        return jsonify({"status": "already running"})
-
-    ssid       = request.form.get("ssid", "").strip()
-    password   = request.form.get("password", "")
-    ntp_server = request.form.get("ntp_server", "pool.ntp.org").strip()
-    skip_wifi  = request.form.get("skip_wifi", "0") == "1"
-    try:
-        utc_offset = int(request.form.get("utc_offset", -5))
-    except ValueError:
-        utc_offset = -5
-
-    with _ntp_lock:
-        _ntp_log = []
-        _ntp_running = True
-
-    t = threading.Thread(
-        target=_ntp_sync_worker,
-        args=(ssid, password, utc_offset, ntp_server, skip_wifi),
-        daemon=True
-    )
-    t.start()
-    return jsonify({"status": "started"})
-
-@app.route("/admin/ntp/status")
-@login_required
-def admin_ntp_status():
-    with _ntp_lock:
-        return jsonify({"running": _ntp_running, "log": list(_ntp_log)})
-
-# ── Admin: Config Card ────────────────────────────────────────────────────────
-#
-# Writes a signed config card (type 0x02) to an NTAG215 containing:
-#   Byte 0: Card type (0x02)
-#   Byte 1: Card version (0x01)
-#   Byte 2: Machine number (0-255)
-#   Byte 3: Blast gate delay (0-15, ×10 seconds)
-#   Byte 4: Reserved
-#   Bytes 5-68: Ed25519 signature over bytes 0-4
-#
-# The ESP32 node reads this card at boot, stores config in NVS flash,
-# and does not require the card again unless NVS is explicitly cleared.
-#
-# Card types:
-#   0x01 = member card
-#   0x02 = config card
-#   0x03 = erase-config card (future use)
-# ─────────────────────────────────────────────────────────────────────────────
-
-CONFIG_CARD_TYPE    = 0x02
-CONFIG_CARD_VERSION = 0x01
-CONFIG_PAYLOAD_LEN  = 5     # bytes 0-4 are signed
-CONFIG_CARD_LEN     = 72    # 5 payload + 64 sig + 3 pad to 4-byte boundary = 72
-
-CONFIG_CARD_PAGE = """<!doctype html><html><head>
-<title>Write Config Card – Woodshop</title>{style}</head><body>
-{nav}
-<div class="container" style="max-width:500px">
-  <div class="card">
-    <h2>⚙ Write Config Card</h2>
-    <p style="color:var(--muted);font-size:.85rem;margin-bottom:.8rem">
-      Programs a node's machine number and blast gate delay into an NTAG215
-      card. The node reads this card once at boot and caches the config in
-      NVS flash — the card is not needed again unless the node is re-flashed
-      or config is explicitly cleared.</p>
-
-    {flash}
-
-    <table style="margin-bottom:.8rem;font-size:.85rem">
-      <tr><th style="width:50%;padding-right:1rem">Machine number</th>
-          <td>0–255 (8-bit node ID)</td></tr>
-      <tr><th>Blast gate delay</th>
-          <td>0–150 s in 10 s steps (4-bit value × 10)</td></tr>
-    </table>
-
-    <div id="opStatus" style="display:none;text-align:center;padding:1rem 0">
-      <div id="opIcon" style="font-size:2.5rem">⏳</div>
-      <div id="opMsg"  style="color:var(--muted);margin-top:.4rem;font-size:.9rem">
-        Starting…</div>
-    </div>
-
-    <div id="opForm">
-      <label>Machine Number (0–255)</label>
-      <input id="machNum" type="number" min="0" max="255" value="0"
-             style="width:120px">
-
-      <label>Blast Gate Delay</label>
-      <select id="blastDelay" style="width:auto">
-        <option value="0">0 s (off)</option>
-        <option value="1">10 s</option>
-        <option value="2">20 s</option>
-        <option value="3">30 s</option>
-        <option value="4">40 s</option>
-        <option value="5">50 s</option>
-        <option value="6">60 s</option>
-        <option value="7">70 s</option>
-        <option value="8">80 s</option>
-        <option value="9">90 s</option>
-        <option value="10">100 s</option>
-        <option value="11">110 s</option>
-        <option value="12">120 s</option>
-        <option value="13">130 s</option>
-        <option value="14">140 s</option>
-        <option value="15">150 s (always on)</option>
-      </select>
-
-      <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.8rem"
-           id="opActions">
-        <button id="startBtn" onclick="startOp()">
-          📡 Start — Place Card on Reader</button>
-        <a href="/admin/users" class="btn"
-           style="background:#333;color:var(--text)">Cancel</a>
-      </div>
-    </div>
-  </div>
-</div>
-<script>
-function setUI(icon, msg) {{
-  document.getElementById('opIcon').textContent = icon;
-  document.getElementById('opMsg').textContent  = msg;
-}}
-function startOp() {{
-  const machNum    = parseInt(document.getElementById('machNum').value);
-  const blastDelay = parseInt(document.getElementById('blastDelay').value);
-  if (isNaN(machNum) || machNum < 0 || machNum > 255) {{
-    alert('Machine number must be 0–255'); return;
-  }}
-  document.getElementById('startBtn').disabled = true;
-  document.getElementById('opStatus').style.display = 'block';
-  setUI('⏳', 'Starting…');
-  fetch('/api/config_card_start', {{
-    method: 'POST',
-    headers: {{'Content-Type':'application/json'}},
-    body: JSON.stringify({{machine_num: machNum, blast_delay: blastDelay}})
-  }}).then(r=>r.json()).then(d=>{{
-    if (d.ok) poll();
-    else setUI('❌', 'Error: '+(d.error||'unknown'));
-  }}).catch(()=>setUI('❌','Network error'));
-}}
-async function poll() {{
-  try {{
-    const d = await (await fetch('/api/card_op_status')).json();
-    if (d.state==='waiting')  {{ setUI('📡', d.message); setTimeout(poll,800); }}
-    else if (d.state==='writing') {{ setUI('✏️', d.message); setTimeout(poll,600); }}
-    else if (d.state==='done') {{
-      setUI('✅', d.message);
-      document.getElementById('opActions').innerHTML =
-        '<a href="/admin/config-card" class="btn">Write Another</a>'
-        +'<a href="/admin/users" class="btn" style="background:#333;color:var(--text)">Done</a>';
-    }} else if (d.state==='error') {{
-      setUI('❌', 'Error: '+d.message);
-      document.getElementById('startBtn').disabled=false;
-    }} else {{ setTimeout(poll,1000); }}
-  }} catch(e) {{ setTimeout(poll,1200); }}
-}}
-</script>
-</body></html>"""
-
-
-def _run_config_card_write(machine_num, blast_delay):
-    """Background thread: write a signed config card via Pi's local PN532."""
-    try:
-        import struct, time
-        import board, busio, digitalio
-        from adafruit_pn532.spi import PN532_SPI
-
-        private_key = _load_card_private_key()
-        if private_key is None:
-            _card_op_set("error", "Private key not found")
-            return
-
-        spi   = busio.SPI(board.SCK, board.MOSI, board.MISO)
-        cs    = digitalio.DigitalInOut(board.CE0)
-        pn532 = PN532_SPI(spi, cs, debug=False)
-        pn532.SAM_configuration()
-
-        # Build 5-byte payload and sign it
-        payload = struct.pack('5B',
-            CONFIG_CARD_TYPE,
-            CONFIG_CARD_VERSION,
-            machine_num & 0xFF,
-            blast_delay & 0x0F,
-            0x00               # reserved
-        )
-        signature  = private_key.sign(payload)   # 64 bytes Ed25519
-        card_bytes = payload + signature          # 69 bytes
-
-        # Pad to 4-byte page boundary → 72 bytes
-        card_bytes += b'\x00' * (CONFIG_CARD_LEN - len(card_bytes))
-
-        _card_op_set("waiting", "Place config card on reader…")
-
-        deadline = time.time() + 60
-        card_uid = None
-        while time.time() < deadline:
-            card_uid = pn532.read_passive_target(timeout=0.5)
-            if card_uid:
-                break
-        if not card_uid:
-            _card_op_set("error", "Timed out waiting for card (60 s)")
-            return
-
-        _card_op_set("writing", "Writing config card…")
-        pages = CONFIG_CARD_LEN // 4
-        for i in range(pages):
-            page = 4 + i
-            pn532.ntag2xx_write_block(page, card_bytes[i*4:(i+1)*4])
-            time.sleep(0.01)
-
-        _card_op_set("done",
-            f"Config card written: machine {machine_num}, "
-            f"blast gate delay {blast_delay * 10} s")
-
-    except Exception as e:
-        _card_op_set("error", str(e))
-
-
-@app.route("/admin/config-card")
-@login_required
-def admin_config_card():
-    flash_html = ""
-    msg = request.args.get("msg", "")
-    if msg:
-        kind = "error" if request.args.get("err") else ""
-        flash_html = f'<div class="flash {kind}">{msg}</div>'
-    return CONFIG_CARD_PAGE.format(
-        style=COMMON_STYLE, nav=NAV_AUTH.format(app_version=__version__), flash=flash_html
-    )
-
-
-@app.route("/api/config_card_start", methods=["POST"])
-@login_required
-def api_config_card_start():
-    """Start a background config card write operation."""
-    with _card_op_lock:
-        if _card_op_status["state"] in ("waiting", "writing"):
-            return jsonify({"error": "operation already in progress"}), 409
-
-    data = request.get_json(silent=True) or {}
-    try:
-        machine_num  = int(data.get("machine_num", 0))
-        blast_delay  = int(data.get("blast_delay", 0))
-    except (ValueError, TypeError):
-        return jsonify({"error": "invalid parameters"}), 400
-
-    if not (0 <= machine_num <= 255):
-        return jsonify({"error": "machine_num out of range 0-255"}), 400
-    if not (0 <= blast_delay <= 15):
-        return jsonify({"error": "blast_delay out of range 0-15"}), 400
-
-    _card_op_set("starting", "")
-    t = threading.Thread(
-        target=_run_config_card_write,
-        args=(machine_num, blast_delay),
-        daemon=True
-    )
-    t.start()
-    return jsonify({"ok": True})
-
-
 FIRMWARE_DIR = os.path.join(BASE_DIR, "firmware")
+FIRMWARE_BIN = "firmware.bin"   # single compiled image; see /firmware/manifest.json
 
 
 # ── OTA Firmware endpoints ────────────────────────────────────────────────────
+# Aug 2026: the client rewrote from ESP32-C3/MicroPython (many loose .py
+# source files, patched individually) to ESP32/C (one compiled binary,
+# flashed as a whole into the inactive OTA partition — see the client's
+# ota_task.cpp for the full explanation). The manifest below changed to
+# match: one firmware.bin, not a list of source files. version.txt and the
+# generic /firmware/<filename> file server both still work exactly as
+# before — only firmware_manifest() below actually changed.
+#
+# To ship an update:
+#   1. Arduino IDE: Sketch > Export Compiled Binary (produces .ino.bin next
+#      to the sketch). Copy it to FIRMWARE_DIR as "firmware.bin".
+#   2. Bump the version string in FIRMWARE_DIR/version.txt to match the new
+#      FW_VERSION you set in the client's config.h.
+#   3. set_ota.py true   (flips UPDATE_AVAILABLE in master_server.py and
+#      restarts woodshop-tcp — unchanged from before)
+#   4. Each node picks up update_available=1 on its next card event (fast
+#      path) or its next periodic self-check (idle nodes, every 10 min —
+#      see OTA_CHECK_INTERVAL_MS), downloads+flashes in the background, and
+#      reboots into it once no card session is open. Nodes already running
+#      the new version see their own version match FIRMWARE_DIR/version.txt
+#      and skip re-flashing, so UPDATE_AVAILABLE can safely stay True for
+#      the whole rollout — no more need to rush set_ota.py false the moment
+#      the last node updates (still worth doing eventually, just not urgent).
 
 @app.route("/firmware/version")
 def firmware_version():
-    """Return current firmware version string."""
+    """Return current firmware version string (human/admin convenience;
+    the client itself reads the "version" field of manifest.json below)."""
     try:
         with open(os.path.join(FIRMWARE_DIR, "version.txt")) as f:
             return f.read().strip()
@@ -2720,29 +1587,233 @@ def firmware_version():
 
 @app.route("/firmware/manifest.json")
 def firmware_manifest():
-    """Return JSON list of {file, md5} for all .py files in firmware dir."""
-    entries = []
-    try:
-        for fname in sorted(os.listdir(FIRMWARE_DIR)):
-            if not fname.endswith(".py") or fname == "__init__.py":
-                continue
-            path = os.path.join(FIRMWARE_DIR, fname)
-            md5  = hashlib.md5(open(path, "rb").read()).hexdigest()
-            entries.append({"file": fname, "md5": md5})
-    except OSError:
-        pass
+    """Return {file, version, md5, size} describing the one firmware.bin,
+    or {} if no image has been staged in FIRMWARE_DIR yet."""
     from flask import jsonify as _jsonify
-    return _jsonify(entries)
+
+    path = os.path.join(FIRMWARE_DIR, FIRMWARE_BIN)
+    if not os.path.isfile(path):
+        return _jsonify({})
+
+    try:
+        with open(os.path.join(FIRMWARE_DIR, "version.txt")) as f:
+            version = f.read().strip()
+    except OSError:
+        version = "0.0.0"
+
+    data = open(path, "rb").read()
+    return _jsonify({
+        "file":    FIRMWARE_BIN,
+        "version": version,
+        "md5":     hashlib.md5(data).hexdigest(),
+        "size":    len(data),
+    })
 
 
 @app.route("/firmware/<path:filename>")
 def firmware_file(filename):
-    """Serve a firmware file for OTA download."""
+    """Serve a firmware file for OTA download (firmware.bin, in practice)."""
     from flask import send_from_directory, abort
     # Prevent path traversal
     if ".." in filename or filename.startswith("/"):
         abort(400)
     return send_from_directory(FIRMWARE_DIR, filename)
+
+
+# ── Diagnostics (diag.h / diag.cpp on the client, Aug 2026) ──────────────────
+# Units installed in the field were rebooting several times in rapid
+# succession with no discernible pattern and no way to have a laptop on
+# Serial when it happened. The client firmware captures why each boot
+# happened (esp_reset_reason + a breadcrumb of what the firmware was doing
+# right before the reset) and POSTs it here once WiFi comes up after any
+# boot that has a report pending. See claude/diag-server-endpoint-spec.md
+# in the Woodshop Client project for the full field-by-field description.
+#
+# No login required here, same trust model as the /firmware/* endpoints
+# above: nodes on the shop LAN post directly, no browser session involved.
+#
+# Storage: one JSONL file per machine number under data/diag/, trimmed to
+# the most recent DIAG_KEEP_PER_MACHINE lines on every write so this can't
+# grow unbounded even if a node reboot-loops for hours. Each accepted
+# report is also appended to the main text logfile (master.log, the same
+# file master_server.py's logger writes to) so bootup/restart codes show
+# up there too, not just on the /admin/diag page.
+#
+# Aug 2026 update: the client's on-device NVS ring buffer (16 entries) is
+# no longer just a last-resort fallback for a report that never arrived --
+# after being offline it now forwards the whole backlog in one POST, so
+# this endpoint accepts either a single report object (the normal case)
+# or a JSON array of report objects (a ring-buffer backlog). Each entry in
+# a batch is stored and logged exactly like a single report would be.
+
+DIAG_DIR              = os.path.join(BASE_DIR, "data", "diag")
+DIAG_KEEP_PER_MACHINE  = 200
+MASTER_LOG_FILE        = os.path.join(BASE_DIR, 'master.log')
+
+def _diag_log_path(machine_num) -> str:
+    return os.path.join(DIAG_DIR, f"diag_machine_{machine_num}.jsonl")
+
+# Separate named logger (not Flask's own) that appends to the same
+# master.log file master_server.py writes to, in the same format, so boot
+# reports interleave chronologically with everything else in that file.
+import logging as _logging
+diag_logger = _logging.getLogger("woodshop.diag")
+diag_logger.setLevel(_logging.INFO)
+if not diag_logger.handlers:
+    _diag_handler = _logging.FileHandler(MASTER_LOG_FILE)
+    _diag_handler.setFormatter(_logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    diag_logger.addHandler(_diag_handler)
+    diag_logger.propagate = False
+
+def _ingest_one_diag_report(data: dict) -> bool:
+    """Validate, store (JSONL), and logfile one report. Returns True if accepted."""
+    if not isinstance(data, dict) or "machine" not in data:
+        return False
+    try:
+        machine = int(data["machine"])
+    except (TypeError, ValueError):
+        return False
+
+    data["_received_at"] = datetime.now().isoformat(timespec="seconds")
+
+    os.makedirs(DIAG_DIR, exist_ok=True)
+    path = _diag_log_path(machine)
+    lines = []
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                lines = f.readlines()
+        except OSError:
+            lines = []
+    lines.append(json.dumps(data) + "\n")
+    lines = lines[-DIAG_KEEP_PER_MACHINE:]
+    with open(path, "w") as f:
+        f.writelines(lines)
+
+    summary = (f"machine={machine} boot={data.get('boot_num','?')} "
+               f"reset_reason={data.get('reset_reason','?')} "
+               f"last_mark={data.get('last_mark','?')}")
+    print(f"[diag] {summary}")
+    diag_logger.info(f"BOOT/RESTART {summary} "
+                      f"fw={data.get('fw_version','?')} "
+                      f"rtc_cpu0={data.get('rtc_reason_cpu0','?')} "
+                      f"rtc_cpu1={data.get('rtc_reason_cpu1','?')} "
+                      f"heartbeats={data.get('heartbeat_count','?')} "
+                      f"heap_last={data.get('free_heap_last','?')} "
+                      f"heap_min={data.get('free_heap_min','?')}")
+    return True
+
+@app.route("/diag/report", methods=["POST"])
+def diag_report():
+    """Ingest one boot's diagnostic report, or a backlog batch (ring-buffer
+    array), from a client node."""
+    payload = request.get_json(silent=True, force=True)
+    if not payload:
+        return jsonify({"error": "bad request"}), 400
+
+    reports = payload if isinstance(payload, list) else [payload]
+    accepted = sum(1 for r in reports if _ingest_one_diag_report(r))
+
+    if accepted == 0:
+        return jsonify({"error": "no valid reports in payload"}), 400
+
+    return "", 204
+
+# Reset reasons that mean "something went wrong" rather than a deliberate
+# restart or a normal cold boot — used to highlight rows red in the viewer.
+_DIAG_BAD_REASONS = {"BROWNOUT", "PANIC", "TASK_WDT", "INTERRUPT_WDT", "OTHER_WDT"}
+
+DIAG_PAGE = """<!doctype html><html><head><title>Diagnostics – Woodshop</title>
+{style}</head><body>
+{nav}
+<div class="container">
+  <div class="card">
+    <h2>Node Reboot Diagnostics</h2>
+    <p style="font-size:.8rem;color:var(--muted);margin-bottom:.5rem">
+      Showing {count} most recent reports across all machines, newest first.
+      Each node POSTs one report per boot once WiFi comes up. Red "Reset
+      Reason" means a brownout, panic, or watchdog fired; green means a
+      deliberate restart (OTA, node giving up init after retries) or a
+      normal power-on. "Breadcrumb Valid" = NO means the RTC memory that
+      carries Last Mark/Heartbeats/Heap didn't survive the reset — either a
+      cold power-on or a brownout deep enough to reset the RTC domain too,
+      which by itself points at the supply rail rather than firmware logic.
+      Auto-refreshes every 60s.</p>
+    {table}
+  </div>
+</div>
+<script>setTimeout(()=>location.reload(),60000);</script>
+</body></html>"""
+
+@app.route("/admin/diag")
+@login_required
+def admin_diag():
+    machines = load_json(MACHINES_FILE, [])
+    mnames = {str(m.get("id", "")): m.get("name", "") for m in machines}
+
+    reports = []
+    if os.path.isdir(DIAG_DIR):
+        for fname in os.listdir(DIAG_DIR):
+            if not (fname.startswith("diag_machine_") and fname.endswith(".jsonl")):
+                continue
+            try:
+                with open(os.path.join(DIAG_DIR, fname)) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            reports.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+            except OSError:
+                continue
+
+    reports.sort(key=lambda r: r.get("_received_at", ""), reverse=True)
+    reports = reports[:300]   # cap what we render in one page
+
+    def _badge(reason):
+        return "badge-out" if reason in _DIAG_BAD_REASONS else "badge-in"
+
+    rows_html = "".join(
+        "<tr>"
+        f"<td style='white-space:nowrap'>{r.get('_received_at','')}</td>"
+        f"<td>{r.get('machine','?')} "
+        f"<span style='color:var(--muted);font-size:.75rem'>"
+        f"({mnames.get(str(r.get('machine','')), '?')})</span></td>"
+        f"<td>{r.get('fw_version','?')}</td>"
+        f"<td style='text-align:right'>{r.get('boot_num','?')}</td>"
+        f"<td><span class='badge {_badge(r.get('reset_reason',''))}'>"
+        f"{r.get('reset_reason','?')}</span></td>"
+        f"<td style='font-size:.75rem'>{r.get('rtc_reason_cpu0','')} / "
+        f"{r.get('rtc_reason_cpu1','')}</td>"
+        f"<td>{'yes' if r.get('prev_run_valid') else 'NO'}</td>"
+        f"<td>{r.get('last_mark','?')}</td>"
+        f"<td style='text-align:right'>{r.get('heartbeat_count','?')}</td>"
+        f"<td style='text-align:right'>{r.get('free_heap_last','?')}</td>"
+        f"<td style='text-align:right'>{r.get('free_heap_min','?')}</td>"
+        "</tr>"
+        for r in reports
+    )
+    if rows_html:
+        table = f"""<div style="overflow-x:auto"><table>
+          <thead><tr>
+            <th>Received</th><th>Machine</th><th>FW</th>
+            <th style='text-align:right'>Boot#</th>
+            <th>Reset Reason</th><th>RTC cpu0 / cpu1</th>
+            <th>Breadcrumb Valid</th><th>Last Mark</th>
+            <th style='text-align:right'>Heartbeats</th>
+            <th style='text-align:right'>Heap Last</th>
+            <th style='text-align:right'>Heap Min</th>
+          </tr></thead>
+          <tbody>{rows_html}</tbody></table></div>"""
+    else:
+        table = '<p class="empty">No diagnostic reports received yet.</p>'
+
+    return DIAG_PAGE.format(
+        style=COMMON_STYLE, nav=NAV_AUTH.format(app_version=__version__),
+        table=table, count=len(reports)
+    )
 
 
 # ── Machines CSV export ────────────────────────────────────────────────────────

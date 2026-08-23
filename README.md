@@ -1,2 +1,0 @@
-# Server
-Woodshop Server

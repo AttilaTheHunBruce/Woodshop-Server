@@ -45,12 +45,14 @@ import sqlite3
 from datetime import datetime
 import logging
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('/home/pi/woodshop/master.log'),
+        logging.FileHandler(os.path.join(BASE_DIR, 'master.log')),
         logging.StreamHandler()
     ]
 )
@@ -69,7 +71,7 @@ STATUS_INVALID_MESSAGE     = 0x0005
 # Set True to signal all nodes to download a software update on next boot.
 # Nodes store this in NVS when received; OTA runs at start of next boot cycle.
 # Workflow:
-#   1. Copy updated .py files to /home/pi/woodshop/firmware/
+#   1. Copy updated .py files to the woodshop firmware/ directory
 #   2. Set UPDATE_AVAILABLE = True and restart: sudo systemctl restart woodshop-tcp
 #   3. Each node picks up the flag on its next card event and stores it in NVS
 #   4. On next reboot the node downloads changed files and clears the flag
@@ -78,7 +80,8 @@ STATUS_INVALID_MESSAGE     = 0x0005
 
 
 
-# Machine number -> name (match rfid_writer.py)
+# Machine number -> name. Zero-based; must match the numbering used by the
+# machine controllers' DIP switches (and by data/machines.json in app.py).
 MACHINES = {
      0: "Table Saw",
      1: "Band Saw",
@@ -94,43 +97,8 @@ MACHINES = {
 def machine_name(num):
     return MACHINES.get(num, f"Machine {num}")
 
-# ── RFID Card Types ───────────────────────────────────────────────────────────
-# Card type byte is stored at payload byte 0 of every NTAG215 card.
-# The ESP32 node inspects this byte before processing card data.
-#
-# 0x01  Member card   — member ID, permissions, name, Ed25519 signature
-# 0x02  Config card   — machine number, blast gate delay, Ed25519 signature
-#                       Node reads once at boot, caches result in NVS flash.
-#                       Card not needed again until NVS is explicitly cleared.
-# 0x03  (reserved)    — future: erase-config card
-#
-# Config card payload layout (5 bytes, signed with Ed25519):
-#   Byte 0: Card type        (0x02)
-#   Byte 1: Card version     (0x01)
-#   Byte 2: Machine number   (0–255)
-#   Byte 3: Blast gate delay (0–15, multiply by 10 for seconds; 15 = always on)
-#   Byte 4: Reserved         (0x00)
-#   Bytes 5–68: Ed25519 signature over bytes 0–4
-
-CARD_TYPE_MEMBER  = 0x01
-CARD_TYPE_CONFIG  = 0x02
-
-def decode_config_card(card_bytes):
-    """
-    Decode a config card payload.
-    Returns (machine_num, blast_delay_val, blast_delay_seconds) or raises ValueError.
-    Does NOT verify the Ed25519 signature — verification happens on the ESP32 node.
-    """
-    if len(card_bytes) < 5:
-        raise ValueError("Config card payload too short")
-    card_type, version, machine_num, blast_raw, _reserved = card_bytes[:5]
-    if card_type != CARD_TYPE_CONFIG:
-        raise ValueError(f"Not a config card (type=0x{card_type:02X})")
-    blast_delay = blast_raw & 0x0F
-    return machine_num, blast_delay, blast_delay * 10
-
-USERS_FILE   = '/home/pi/woodshop/data/users.json'
-CSV_LOG_FILE = '/home/pi/woodshop/data/access_log.csv'
+USERS_FILE   = os.path.join(BASE_DIR, 'data', 'users.json')
+CSV_LOG_FILE = os.path.join(BASE_DIR, 'data', 'access_log.csv')
 
 def member_name(member_id):
     """Look up member name from users.json by member ID."""
@@ -147,6 +115,27 @@ def member_name(member_id):
     except Exception:
         pass
     return f"Member {member_id}"
+
+
+def member_permissions(member_id):
+    """
+    Look up a member's machine-access permission string from users.json by
+    member ID. Returns '' if the member isn't found or has no permissions
+    set. This is the "member file" referenced by the active_members table --
+    read once at login time and snapshotted into the row, per the Aug 2026
+    Login/logout redesign (Server itself no longer decides eligibility;
+    Login does, and just tells us who's currently signed in).
+    """
+    try:
+        with open(USERS_FILE) as f:
+            users = json.load(f)
+        mid = str(member_id)
+        for u in users:
+            if str(u.get('id', '')) == mid:
+                return u.get('permissions', '') or ''
+    except Exception:
+        pass
+    return ''
 
 
 class BinaryMessage:
@@ -321,8 +310,8 @@ class BinaryMessage:
 class Database:
     """SQLite database for storing woodshop session data"""
 
-    def __init__(self, db_path='/home/pi/woodshop/woodshop.db'):
-        self.db_path = db_path
+    def __init__(self, db_path=None):
+        self.db_path = db_path or os.path.join(BASE_DIR, 'woodshop.db')
         self.init_database()
 
     def init_database(self):
@@ -380,9 +369,88 @@ class Database:
             )
         ''')
 
+        # Aug 2026 redesign: who's currently signed in at Login's door
+        # reader. A row is inserted (or replaced) when Login sends a login
+        # message on port 45432, and deleted when Login sends the matching
+        # logout message. Someone with no row here cannot use any machine --
+        # this is the sole runtime gate for machine access now (replacing
+        # the old RFID-card-carries-its-own-permissions model). SQLite
+        # gives us write-through persistence across a power outage for
+        # free, same as the sessions/machines tables above.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS active_members (
+                member_id   INTEGER PRIMARY KEY,
+                first_name  TEXT,
+                last_name   TEXT,
+                login_time  TIMESTAMP,
+                permissions TEXT
+            )
+        ''')
+
         conn.commit()
         conn.close()
         logger.info("Database initialized")
+
+    # ── active_members: who's currently signed in ──────────────────────────
+
+    def login_member(self, member_id, first_name, last_name, login_time, permissions):
+        """
+        Insert or replace the active_members row for member_id. Called on a
+        LOGIN message from Login (port 45432). permissions is the raw
+        '0'/'1' bit string snapshotted from the reduced member file at
+        login time -- see member_permissions() above.
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO active_members
+            (member_id, first_name, last_name, login_time, permissions)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (member_id, first_name, last_name, login_time, permissions))
+        conn.commit()
+        conn.close()
+
+    def logout_member(self, member_id):
+        """Delete the active_members row for member_id. Called on a LOGOUT
+        message from Login (port 45432)."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM active_members WHERE member_id = ?', (member_id,))
+        conn.commit()
+        conn.close()
+
+    def get_active_member(self, member_id):
+        """Return (member_id, first_name, last_name, login_time, permissions)
+        for a currently signed-in member, or None if they're not signed in."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT member_id, first_name, last_name, login_time, permissions
+            FROM active_members WHERE member_id = ?
+        ''', (member_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return row
+
+    def is_authorized(self, member_id, machine_number):
+        """
+        True if member_id is currently signed in (present in
+        active_members) AND their snapshotted permission string grants
+        access to machine_number.
+
+        Bit convention: bit index == machine_number, 0-based -- matching
+        this file's own MACHINES dict (0: "Table Saw", ...). Confirmed:
+        machine 0 is not skipped/reserved, so this direct mapping is fine.
+        """
+        row = self.get_active_member(member_id)
+        if row is None:
+            return False
+        permissions = row[4]
+        if not permissions:
+            return False
+        if machine_number < 0 or machine_number >= len(permissions):
+            return False
+        return permissions[machine_number] == '1'
 
     def log_raw_message(self, msg):
         conn = sqlite3.connect(self.db_path)
@@ -681,6 +749,17 @@ class WoodshopServer:
                     f"starts={msg.starts} stops={msg.stops} override=0x{msg.override:02X}")
 
         if msg.is_insert:
+            # Override-mode bypass (admin override switch on the node itself)
+            # still works exactly as before, with no active_members check.
+            if not msg.is_override_mode:
+                if not self.database.is_authorized(msg.member_id, msg.machine_number):
+                    logger.warning(
+                        f"NOT AUTHORIZED: Member={msg.member_id_dec} "
+                        f"({member_name(msg.member_id)}), "
+                        f"Machine={msg.machine_number} ({machine_name(msg.machine_number)}) "
+                        f"-- not signed in, or no permission for this machine")
+                    return STATUS_MEMBER_NOT_AUTHORIZED
+
             logger.info(f"INSERT: Member={msg.member_id_dec} ({member_name(msg.member_id)}), "
                         f"Machine={msg.machine_number} ({machine_name(msg.machine_number)}), "
                         f"Auth={msg.auth_status_str}")
@@ -722,13 +801,141 @@ class WoodshopServer:
         logger.info("Server stopped")
 
 
+class LoginListener:
+    """
+    TCP listener for Login's (Lee's Pi) login/logout messages, port 45432.
+
+    Fixed 52-character ASCII message, one connection per message:
+        messageType : 1 char   ('0' = login, '1' = logout -- confirmed,
+                                 matches the old 0/1 numeric convention
+                                 from the original binary design, just
+                                 sent as an ASCII digit now)
+        timestamp   : 15 chars 'YYYYMMDD HHMMSS' (Login's own clock --
+                                 Server has no independent time source
+                                 anymore, no WWVB/DS3231)
+        memberID    : 4 chars  decimal, e.g. '1023' (matches the same
+                                 memberID space used elsewhere, e.g. the
+                                 sample users seeded in app.py: 1001-1003)
+        firstName   : 16 chars space-padded
+        lastName    : 16 chars space-padded
+
+    A login message inserts/replaces a row in active_members, with
+    login_time set directly from the message's own timestamp (not from
+    Server's clock) and permissions looked up fresh from the reduced
+    member file at that moment. A logout message deletes the row. No
+    clock-sync/SyncedClock step -- Server doesn't need one for this.
+    """
+
+    MSG_SIZE = 52
+    TYPE_LOGIN  = '0'
+    TYPE_LOGOUT = '1'
+
+    def __init__(self, database, host='0.0.0.0', port=45432):
+        self.database = database
+        self.host = host
+        self.port = port
+        self.running = False
+        self.server_socket = None
+
+    def start(self):
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(5)
+            self.running = True
+            logger.info(f"Login listener started on {self.host}:{self.port} "
+                        f"(expecting {self.MSG_SIZE}-byte ASCII messages)")
+            while self.running:
+                try:
+                    client_socket, client_address = self.server_socket.accept()
+                    t = threading.Thread(target=self.handle_client,
+                                         args=(client_socket, client_address))
+                    t.daemon = True
+                    t.start()
+                except Exception as e:
+                    if self.running:
+                        logger.error(f"Login listener accept error: {e}")
+        except Exception as e:
+            logger.error(f"Login listener error: {e}")
+        finally:
+            if self.server_socket:
+                self.server_socket.close()
+
+    def handle_client(self, client_socket, client_address):
+        try:
+            data = b''
+            while len(data) < self.MSG_SIZE:
+                chunk = client_socket.recv(self.MSG_SIZE - len(data))
+                if not chunk:
+                    break
+                data += chunk
+
+            if len(data) != self.MSG_SIZE:
+                logger.warning(f"Login listener: incomplete message from "
+                               f"{client_address} ({len(data)}/{self.MSG_SIZE} bytes)")
+                return
+
+            self.process_message(data, client_address)
+        except Exception as e:
+            logger.error(f"Login listener error handling {client_address}: {e}")
+        finally:
+            client_socket.close()
+
+    def process_message(self, data, client_address):
+        text = data.decode('ascii', errors='replace')
+        msg_type   = text[0:1]
+        ts_str     = text[1:16]
+        member_str = text[16:20]
+        first_name = text[20:36].strip()
+        last_name  = text[36:52].strip()
+
+        try:
+            member_id = int(member_str.strip())
+        except ValueError:
+            logger.error(f"Login listener: bad memberID {member_str!r} from {client_address}")
+            return
+
+        try:
+            login_time = datetime.strptime(ts_str, "%Y%m%d %H%M%S")
+        except ValueError:
+            logger.error(f"Login listener: bad timestamp {ts_str!r} from "
+                         f"{client_address} -- using Server's local time instead")
+            login_time = datetime.now()
+
+        if msg_type == self.TYPE_LOGIN:
+            permissions = member_permissions(member_id)
+            self.database.login_member(member_id, first_name, last_name,
+                                       login_time, permissions)
+            logger.info(f"LOGIN: Member={member_id} ({first_name} {last_name}) "
+                        f"at {login_time}"
+                        + ("" if permissions else "  [WARNING: no permissions on file]"))
+        elif msg_type == self.TYPE_LOGOUT:
+            self.database.logout_member(member_id)
+            logger.info(f"LOGOUT: Member={member_id} ({first_name} {last_name}) "
+                        f"at {login_time}")
+        else:
+            logger.warning(f"Login listener: unknown messageType {msg_type!r} "
+                           f"from {client_address}")
+
+    def stop(self):
+        self.running = False
+        if self.server_socket:
+            self.server_socket.close()
+        logger.info("Login listener stopped")
+
+
 def main():
     logger.info("Starting Woodshop Master Server...")
     server = WoodshopServer(host='0.0.0.0', port=35487)
+    login_listener = LoginListener(server.database, host='0.0.0.0', port=45432)
+    login_thread = threading.Thread(target=login_listener.start, daemon=True)
+    login_thread.start()
     try:
         server.start()
     except KeyboardInterrupt:
         logger.info("\nShutting down...")
+        login_listener.stop()
         server.stop()
 
 
