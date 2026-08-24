@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=dietpi
-WorkingDirectory=/home/dietpi/woodshop
-ExecStart=/home/dietpi/woodshop/venv/bin/python /home/dietpi/woodshop/master_server.py
+User=woodshop
+WorkingDirectory=/home/woodshop/woodshop
+ExecStart=/home/woodshop/woodshop/venv/bin/python /home/woodshop/woodshop/master_server.py
 Restart=on-failure
 RestartSec=5
 

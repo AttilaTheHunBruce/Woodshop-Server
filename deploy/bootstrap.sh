@@ -16,7 +16,7 @@ set -euo pipefail
 
 REPO_URL="${WOODSHOP_REPO_URL:-https://github.com/YOUR_USER/YOUR_REPO.git}"
 BRANCH="${WOODSHOP_BRANCH:-main}"
-APP_USER="dietpi"
+APP_USER="woodshop"
 APP_HOME="/home/${APP_USER}/woodshop"
 VENV="${APP_HOME}/venv"
 
@@ -25,11 +25,19 @@ if [[ "${REPO_URL}" == *YOUR_USER/YOUR_REPO* ]]; then
     exit 1
 fi
 
-echo "==> [1/6] Installing system packages..."
+echo "==> [1/7] Installing system packages..."
 sudo apt-get update
 sudo apt-get install -y git python3 python3-venv python3-pip authbind sqlite3
 
-echo "==> [2/6] Fetching source (${REPO_URL}, branch ${BRANCH})..."
+echo "==> [2/7] Ensuring dedicated '${APP_USER}' service account exists..."
+if ! id "${APP_USER}" &>/dev/null; then
+    sudo useradd --create-home --shell /usr/sbin/nologin "${APP_USER}"
+    echo "    Created ${APP_USER} (home /home/${APP_USER}, no login shell)."
+else
+    echo "    ${APP_USER} already exists -- leaving as is."
+fi
+
+echo "==> [3/7] Fetching source (${REPO_URL}, branch ${BRANCH})..."
 if [ -d "${APP_HOME}/.git" ]; then
     echo "    Existing checkout found -- pulling latest."
     sudo -u "${APP_USER}" git -C "${APP_HOME}" fetch origin "${BRANCH}"
@@ -39,20 +47,20 @@ else
     sudo -u "${APP_USER}" git clone --branch "${BRANCH}" "${REPO_URL}" "${APP_HOME}"
 fi
 
-echo "==> [3/6] Building Python venv and installing dependencies..."
+echo "==> [4/7] Building Python venv and installing dependencies..."
 sudo -u "${APP_USER}" python3 -m venv "${VENV}"
 sudo -u "${APP_USER}" "${VENV}/bin/pip" install --upgrade pip
 sudo -u "${APP_USER}" "${VENV}/bin/pip" install -r "${APP_HOME}/requirements.txt"
 
-echo "==> [4/6] Ensuring runtime data directories exist (not tracked in git)..."
+echo "==> [5/7] Ensuring runtime data directories exist (not tracked in git)..."
 sudo -u "${APP_USER}" mkdir -p "${APP_HOME}/data/diag" "${APP_HOME}/firmware"
 
-echo "==> [5/6] Configuring authbind so app.py can bind :80 as ${APP_USER}..."
+echo "==> [6/7] Configuring authbind so app.py can bind :80 as ${APP_USER}..."
 sudo touch /etc/authbind/byport/80
 sudo chown "${APP_USER}" /etc/authbind/byport/80
 sudo chmod 500 /etc/authbind/byport/80
 
-echo "==> [6/6] Installing systemd units and (re)starting services..."
+echo "==> [7/7] Installing systemd units and (re)starting services..."
 sudo cp "${APP_HOME}/deploy/woodshop.service"     /etc/systemd/system/woodshop.service
 sudo cp "${APP_HOME}/deploy/woodshop-tcp.service" /etc/systemd/system/woodshop-tcp.service
 sudo systemctl daemon-reload

@@ -1,5 +1,8 @@
 # Deploying the Woodshop server to DietPi (Raspberry Pi 2B)
 
+Runs as a dedicated `woodshop` service account, files at
+`/home/woodshop/woodshop` — not under the DietPi default `dietpi` login.
+
 ## What changed from the last working version
 
 **Path portability.** The server used to hardcode `/home/pi/woodshop` in
@@ -8,8 +11,45 @@ handler, `USERS_FILE`, `CSV_LOG_FILE`, and `Database`'s default
 `db_path`). DietPi's default account is `dietpi`, not `pi`, so those paths
 would have pointed nowhere. They're now derived from `BASE_DIR`
 (`os.path.dirname(os.path.abspath(__file__))`), same pattern the rest of
-`app.py` already used. The two `.service` files match: `User=dietpi`,
-`WorkingDirectory=/home/dietpi/woodshop`.
+`app.py` already used.
+
+**Dedicated service account.** The app now runs as its own `woodshop`
+user (home `/home/woodshop`, no login shell) rather than the DietPi
+default `dietpi` account, so the project's files, logs, and data all live
+in one predictable, self-documenting place (`/home/woodshop/woodshop`)
+regardless of which human accounts exist on the Pi -- easier for whoever
+inherits this to find everything. `bootstrap.sh` creates this user
+automatically if it doesn't exist (`useradd --create-home --shell
+/usr/sbin/nologin woodshop`). The two `.service` files match: `User=woodshop`,
+`WorkingDirectory=/home/woodshop/woodshop`.
+
+If you have an existing `dietpi`-owned deployment, migrate with:
+
+```bash
+sudo useradd --create-home --shell /usr/sbin/nologin woodshop
+sudo systemctl stop woodshop woodshop-tcp
+sudo mv /home/woodshop/woodshop /home/woodshop/woodshop
+sudo chown -R woodshop:woodshop /home/woodshop/woodshop
+sudo cp /home/woodshop/woodshop/deploy/woodshop.service     /etc/systemd/system/woodshop.service
+sudo cp /home/woodshop/woodshop/deploy/woodshop-tcp.service /etc/systemd/system/woodshop-tcp.service
+sudo touch /etc/authbind/byport/80   # re-chown for the new user
+sudo chown woodshop /etc/authbind/byport/80
+sudo systemctl daemon-reload
+sudo systemctl restart woodshop woodshop-tcp
+```
+
+**A note on `BASE_DIR` and how you invoke the app for testing.** `BASE_DIR
+= os.path.dirname(os.path.abspath(__file__))` only resolves correctly when
+`app.py`/`master_server.py` are run as scripts (`python app.py`, which is
+exactly what both systemd units do -- this is not a bug in the deployed
+service). If you instead open an interactive `python3` shell on the Pi and
+paste or `exec()` the file's contents to poke at it, Python 3.13's new
+REPL (`_pyrepl`) can leave `__file__` pointing at its own launcher
+(`/usr/lib/python3.13/_pyrepl/__main__.py`) instead of your script, which
+sends `BASE_DIR` -- and therefore every data/log/db path -- somewhere
+bogus. If you ever see paths like that in a log or traceback, it means
+the code was run interactively, not via `python3 app.py` or the service;
+it's not something the dedicated user fixes by itself.
 
 **No more card reading/writing on the server.** The server used to run a
 PN532 NFC reader over SPI to write signed "config cards" (`/admin/config-
@@ -65,13 +105,21 @@ dependency. Nothing to do here.
 
    ```bash
    curl -fsSL https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/deploy/bootstrap.sh | bash
+
+https://github.com/AttilaTheHunBruce/Woodshop-Server.git
+
+   curl -fsSL https://raw.githubusercontent.com/AttilaTheHunBruce/Woodshop-Server/main/deploy/bootstrap.sh | bash
+
    ```
+
 
    Same command for first install and every later "rebuild the whole
    server program." It:
 
    - installs `git`, `python3-venv`, `authbind`, `sqlite3`
-   - clones (or `fetch` + `reset --hard`s) the repo into `/home/dietpi/woodshop`
+   - creates the `woodshop` service user if it doesn't already exist
+     (`useradd --create-home --shell /usr/sbin/nologin woodshop`)
+   - clones (or `fetch` + `reset --hard`s) the repo into `/home/woodshop/woodshop`
    - builds/rebuilds the venv and installs `requirements.txt` (just Flask now)
    - creates `data/` and `firmware/` if missing (never overwrites them)
    - sets up `authbind` so `app.py` can bind port 80 as a non-root user
@@ -103,7 +151,7 @@ touched (all git-ignored, see `.gitignore`).
 If you only changed Python and don't need the full apt/venv pass:
 
 ```bash
-cd /home/dietpi/woodshop
+cd /home/woodshop/woodshop
 git pull
 sudo systemctl restart woodshop woodshop-tcp
 ```
@@ -141,6 +189,6 @@ Unchanged — `set_ota.py` still edits the `UPDATE_AVAILABLE` flag in
 `master_server.py` and restarts `woodshop-tcp`:
 
 ```bash
-cd /home/dietpi/woodshop
+cd /home/woodshop/woodshop
 sudo venv/bin/python set_ota.py true    # or false / status
 ```

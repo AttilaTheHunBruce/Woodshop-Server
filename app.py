@@ -724,6 +724,7 @@ USERS_LIST_PAGE = """<!doctype html><html><head><title>All Users – Woodshop</t
           <th>RFID</th>
           <th><a class="sort-link" onclick="sortTable(4)">Expiry ⇅</a></th>
           <th>Status</th>
+          <th>Perms</th>
           <th></th>
         </tr></thead>
         <tbody>{rows}</tbody>
@@ -808,6 +809,8 @@ def admin_users_list():
         rfid   = u.get('rfid','')
         expiry = u.get('expiry','')
         css, label = _renew_status(u)
+        perm_bits  = _perms_to_list(u.get('permissions',''))
+        perm_count = sum(perm_bits[:NUM_MACHINES])
         rows_html += (
             f'<tr data-status="{css}">'
             f'<td>{uid}</td>'
@@ -816,6 +819,7 @@ def admin_users_list():
             f'<td style="font-family:monospace;font-size:.8rem">{rfid}</td>'
             f'<td style="font-size:.8rem">{expiry}</td>'
             f'<td><span class="status-{css}">{label}</span></td>'
+            f'<td style="font-size:.8rem;white-space:nowrap">{perm_count}/{NUM_MACHINES}</td>'
             f'<td style="white-space:nowrap">'
             f'<a href="/admin/users/edit?uid={uid}" class="btn btn-sm">Edit</a> '
             f'<button class="btn btn-sm btn-danger"'
@@ -1724,11 +1728,23 @@ def diag_report():
 _DIAG_BAD_REASONS = {"BROWNOUT", "PANIC", "TASK_WDT", "INTERRUPT_WDT", "OTHER_WDT"}
 
 DIAG_PAGE = """<!doctype html><html><head><title>Diagnostics – Woodshop</title>
-{style}</head><body>
+{style}
+<style>
+  .legend-grid{{display:grid;grid-template-columns:auto 1fr;gap:.25rem .8rem;
+                font-size:.8rem;align-items:baseline}}
+  .legend-grid .badge{{justify-self:start}}
+</style>
+</head><body>
 {nav}
 <div class="container">
   <div class="card">
-    <h2>Node Reboot Diagnostics</h2>
+    <h2>Current Status by Machine</h2>
+    <p style="font-size:.8rem;color:var(--muted);margin-bottom:.5rem">
+      Most recent boot report received from each machine.</p>
+    {status_table}
+  </div>
+  <div class="card">
+    <h2>Full Boot History</h2>
     <p style="font-size:.8rem;color:var(--muted);margin-bottom:.5rem">
       Showing {count} most recent reports across all machines, newest first.
       Each node POSTs one report per boot once WiFi comes up. Red "Reset
@@ -1741,9 +1757,43 @@ DIAG_PAGE = """<!doctype html><html><head><title>Diagnostics – Woodshop</title
       Auto-refreshes every 60s.</p>
     {table}
   </div>
+  <div class="card">
+    <details>
+      <summary style="cursor:pointer;color:var(--accent);font-weight:600">
+        Reset code legend</summary>
+      <div class="legend-grid" style="margin-top:.6rem">
+        {legend}
+      </div>
+    </details>
+  </div>
 </div>
 <script>setTimeout(()=>location.reload(),60000);</script>
 </body></html>"""
+
+# Standard ESP32 reset reasons (esp_reset_reason_t) as the client firmware
+# labels them. Not every node/firmware version will emit every one of
+# these — unrecognized strings just render with no legend match, still
+# green/red per _DIAG_BAD_REASONS.
+_DIAG_REASON_LEGEND = [
+    ("POWERON",       "ok",  "Normal cold boot / power-up."),
+    ("EXT",           "ok",  "External reset pin/button pulled low."),
+    ("SW",            "ok",  "Software-triggered reset (e.g. esp_restart(), OTA)."),
+    ("DEEPSLEEP",     "ok",  "Woke from deep sleep."),
+    ("SDIO",          "ok",  "Reset via SDIO slave (uncommon on client nodes)."),
+    ("USB",           "ok",  "USB peripheral reset."),
+    ("JTAG",          "ok",  "Reset via JTAG debugger."),
+    ("BROWNOUT",      "bad", "Brownout detector fired — supply voltage sagged too low."),
+    ("PANIC",         "bad", "Firmware panic / unhandled exception — crash."),
+    ("INT_WDT",       "bad", "Interrupt watchdog timeout — an ISR ran too long."),
+    ("INTERRUPT_WDT", "bad", "Interrupt watchdog timeout — an ISR ran too long."),
+    ("TASK_WDT",      "bad", "Task watchdog timeout — a task hung and didn't yield."),
+    ("WDT",           "bad", "Hardware/RTC watchdog timeout — main loop stalled."),
+    ("OTHER_WDT",     "bad", "Some other watchdog fired (not interrupt/task specific)."),
+    ("EFUSE",         "bad", "eFuse error reset — hardware issue."),
+    ("PWR_GLITCH",    "bad", "Power glitch detected on the supply rail."),
+    ("CPU_LOCKUP",    "bad", "CPU lockup detected."),
+    ("UNKNOWN",       "bad", "Reset reason could not be determined."),
+]
 
 @app.route("/admin/diag")
 @login_required
@@ -1770,10 +1820,53 @@ def admin_diag():
                 continue
 
     reports.sort(key=lambda r: r.get("_received_at", ""), reverse=True)
-    reports = reports[:300]   # cap what we render in one page
 
     def _badge(reason):
         return "badge-out" if reason in _DIAG_BAD_REASONS else "badge-in"
+
+    # Latest report per machine (reports are already newest-first).
+    latest_by_machine = {}
+    for r in reports:
+        m = str(r.get("machine", ""))
+        if m not in latest_by_machine:
+            latest_by_machine[m] = r
+
+    reports = reports[:300]   # cap what we render in the full-history table
+
+    if latest_by_machine:
+        def _mnum(m):
+            try:
+                return int(m)
+            except (TypeError, ValueError):
+                return float("inf")
+        status_rows = "".join(
+            "<tr>"
+            f"<td>{m} <span style='color:var(--muted);font-size:.75rem'>"
+            f"({mnames.get(m, '?')})</span></td>"
+            f"<td style='white-space:nowrap'>{r.get('_received_at','')}</td>"
+            f"<td><span class='badge {_badge(r.get('reset_reason',''))}'>"
+            f"{r.get('reset_reason','?')}</span></td>"
+            f"<td style='text-align:right'>{r.get('boot_num','?')}</td>"
+            f"<td>{r.get('fw_version','?')}</td>"
+            f"<td style='text-align:right'>{r.get('free_heap_min','?')}</td>"
+            "</tr>"
+            for m, r in sorted(latest_by_machine.items(), key=lambda kv: _mnum(kv[0]))
+        )
+        status_table = f"""<div style="overflow-x:auto"><table>
+          <thead><tr>
+            <th>Machine</th><th>Last Boot</th><th>Reset Reason</th>
+            <th style='text-align:right'>Boot#</th><th>FW</th>
+            <th style='text-align:right'>Heap Min</th>
+          </tr></thead>
+          <tbody>{status_rows}</tbody></table></div>"""
+    else:
+        status_table = '<p class="empty">No diagnostic reports received yet.</p>'
+
+    legend_html = "".join(
+        f"<span class='badge {'badge-out' if sev == 'bad' else 'badge-in'}'>{code}</span>"
+        f"<span>{desc}</span>"
+        for code, sev, desc in _DIAG_REASON_LEGEND
+    )
 
     rows_html = "".join(
         "<tr>"
@@ -1812,7 +1905,8 @@ def admin_diag():
 
     return DIAG_PAGE.format(
         style=COMMON_STYLE, nav=NAV_AUTH.format(app_version=__version__),
-        table=table, count=len(reports)
+        status_table=status_table, table=table, count=len(reports),
+        legend=legend_html
     )
 
 
