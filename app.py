@@ -1772,16 +1772,29 @@ def firmware_file(filename):
 
     Lights led_wht for the duration of the transfer (see _download_started/
     _download_finished above) — this is the actual point a node is pulling
-    bytes, as opposed to just checking /firmware/manifest.json. The normal
-    path is call_on_close() firing when the transfer ends; the failsafe
-    timer started inside _download_started() is the backstop if it doesn't
-    (aborted connection, node reboot mid-download, etc.)."""
+    bytes, as opposed to just checking /firmware/manifest.json.
+
+    send_from_directory() sets direct_passthrough=True by default (a
+    streaming optimization). That matters here: Werkzeug's Response.__call__
+    only wraps the body in the ClosingIterator that actually invokes
+    call_on_close() callbacks when direct_passthrough is False -- when it's
+    True (the default for file responses), the raw file iterator is handed
+    straight to the WSGI server and call_on_close() never fires, on ANY
+    transfer, success or failure. Confirmed 2026-08-26: a clean, fully
+    completed download still left the white LED on indefinitely (the 5-
+    minute failsafe timer in _download_started() would have caught it
+    eventually, but that's a bad substitute for "off right when the
+    transfer ends"). Forcing direct_passthrough back off routes the
+    response through the normal iterator path where call_on_close() is
+    actually honored -- fine for firmware-sized files on a LAN, and this
+    endpoint isn't hot enough for the streaming optimization to matter."""
     from flask import send_from_directory, abort
     # Prevent path traversal
     if ".." in filename or filename.startswith("/"):
         abort(400)
     token = _download_started()
     response = send_from_directory(FIRMWARE_DIR, filename)
+    response.direct_passthrough = False
     response.call_on_close(lambda: _download_finished(token))
     return response
 
