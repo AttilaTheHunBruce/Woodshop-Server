@@ -1,1 +1,2 @@
 Flask>=2.3,<3
+gpiozero>=2.0

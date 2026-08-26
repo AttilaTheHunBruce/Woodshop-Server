@@ -13,6 +13,7 @@ __version__ = "1.0.0"
 import os
 import json
 import csv
+import sqlite3
 import hashlib
 import secrets
 import socket
@@ -30,8 +31,9 @@ BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE       = os.path.join(BASE_DIR, "data", "access_log.csv")
 USERS_FILE     = os.path.join(BASE_DIR, "data", "users.json")
 MACHINES_FILE  = os.path.join(BASE_DIR, "data", "machines.json")
-ACTIVE_FILE    = os.path.join(BASE_DIR, "data", "active_sessions.json")
+ACTIVE_FILE    = os.path.join(BASE_DIR, "data", "active_sessions.json")  # legacy, unused since Aug 2026
 ADMIN_CREDS    = os.path.join(BASE_DIR, "data", "admin_creds.json")
+DB_PATH        = os.path.join(BASE_DIR, "woodshop.db")  # written by master_server.py
 
 # ── Membership settings ───────────────────────────────────────────────────────
 MEMBERSHIP_GRACE_DAYS   = 90   # Days after Dec 31 before access is cut off (default: 90 = April 1)
@@ -369,19 +371,68 @@ ACTIVE_PAGE = """<!doctype html><html><head><title>Active – Woodshop</title>
 <script>setTimeout(()=>location.reload(),30000);</script>
 </body></html>"""
 
+def get_active_members():
+    """
+    Query the active_members table for everyone currently signed in.
+    This table is maintained entirely by master_server.py Login listener
+    (port 45432): a row is inserted on LOGIN and deleted on LOGOUT, keyed
+    by member_id (PRIMARY KEY), so there is never more than one row per
+    member -- re-logging in just replaces the existing row (INSERT OR
+    REPLACE) rather than creating a duplicate.
+    Returns a list of (member_id, first_name, last_name, login_time,
+    permissions) tuples, oldest login first. Returns [] if the DB or
+    table is not there yet (e.g. master_server.py has not started).
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT member_id, first_name, last_name, login_time, permissions "
+            "FROM active_members ORDER BY login_time"
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+    except sqlite3.Error:
+        return []
+
+
+def _permitted_machine_names(perm_str, machines):
+    """Names of machines a snapshotted permission string grants access to."""
+    bits = _perms_to_list(perm_str)
+    mname = {}
+    for m in machines:
+        try:
+            idx = int(m.get("id", m.get("machine_num", -1))) - 1  # 1-based -> 0-based
+            if 0 <= idx < NUM_MACHINES:
+                mname[idx] = m.get("name", m.get("machine_name", "")) or f"M{idx + 1}"
+        except (ValueError, TypeError):
+            pass
+    return [mname.get(i, f"M{i + 1}") for i in range(NUM_MACHINES) if bits[i]]
+
+
+def _fmt_login_time(ts):
+    try:
+        return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return ts or "?"
+
+
 @app.route("/active")
 @login_required
 def active():
-    sessions = load_json(ACTIVE_FILE, [])
-    if sessions:
+    machines = load_json(MACHINES_FILE, [])
+    members  = get_active_members()
+    if members:
         rows = "".join(
-            f"<tr><td>{s.get('user_name','?')}</td>"
-            f"<td>{s.get('machine_name','?')}</td>"
-            f"<td>{s.get('since','?')}</td></tr>"
-            for s in sessions
+            f"<tr><td>{last_name} {first_name} "
+            f"<span style='color:var(--muted);font-size:.75rem'>({member_id})</span></td>"
+            f"<td>{_fmt_login_time(login_time)}</td>"
+            f"<td>{', '.join(_permitted_machine_names(permissions, machines)) or chr(8212)}</td></tr>"
+            for member_id, first_name, last_name, login_time, permissions in members
         )
         content = f"""<table>
-          <thead><tr><th>User</th><th>Machine</th><th>Since</th></tr></thead>
+          <thead><tr><th>User</th><th>Since</th><th>Machine Permissions</th></tr></thead>
           <tbody>{rows}</tbody>
         </table>
         <p style="font-size:.8rem;color:var(--muted);margin-top:.6rem">
@@ -522,7 +573,18 @@ def api_logs():
 @app.route("/api/active")
 @login_required
 def api_active():
-    return jsonify(load_json(ACTIVE_FILE, []))
+    machines = load_json(MACHINES_FILE, [])
+    return jsonify([
+        {
+            "member_id": member_id,
+            "first_name": first_name,
+            "last_name": last_name,
+            "login_time": login_time,
+            "permissions": permissions,
+            "machines": _permitted_machine_names(permissions, machines),
+        }
+        for member_id, first_name, last_name, login_time, permissions in get_active_members()
+    ])
 
 # ── Admin: Users — full management flow ───────────────────────────────────────
 #

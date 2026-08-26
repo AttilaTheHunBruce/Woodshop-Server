@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-REPO_URL="${WOODSHOP_REPO_URL:-https://github.com/YOUR_USER/YOUR_REPO.git}"
+REPO_URL="${WOODSHOP_REPO_URL:-https://github.com/AttilaTheHunBruce/Woodshop-Server.git}"
 BRANCH="${WOODSHOP_BRANCH:-main}"
 APP_USER="woodshop"
 APP_HOME="/home/${APP_USER}/woodshop"
@@ -36,6 +36,8 @@ if ! id "${APP_USER}" &>/dev/null; then
 else
     echo "    ${APP_USER} already exists -- leaving as is."
 fi
+# Needed for gpiozero to open /dev/gpiochip0 for the status LEDs.
+sudo usermod -aG gpio "${APP_USER}"
 
 echo "==> [3/7] Fetching source (${REPO_URL}, branch ${BRANCH})..."
 if [ -d "${APP_HOME}/.git" ]; then

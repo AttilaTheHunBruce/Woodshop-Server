@@ -42,6 +42,8 @@ import json
 import struct
 import time
 import sqlite3
+import signal
+import sys
 from datetime import datetime
 import logging
 
@@ -57,6 +59,106 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+# ── Status LEDs ────────────────────────────────────────────────────────────
+# Wired through a driver board on the Pi's GPIO header:
+#   GPIO25 (red) - lit while the server is inoperable
+#   GPIO20 (grn) - lit while the server is running normally
+#   GPIO24 (blu) - flashes 2s on a message from Lee's machine (port 45432)
+#   GPIO26 (yel) - flashes 2s on a message from a machine controller (port 35487)
+#   GPIO27 (wht) - unused
+#
+# LED setup is defensive: if gpiozero or its pin backend isn't available
+# (e.g. missing python3-lgpio, or a udev permission issue), the server logs
+# a warning and keeps running with the LEDs disabled rather than crashing.
+class _NullLED:
+    def on(self):  pass
+    def off(self): pass
+
+
+def _make_led(pin):
+    try:
+        from gpiozero import LED
+        led = LED(pin)
+        logger.info(f"Status LED on GPIO{pin} initialized OK")
+        return led
+    except Exception as e:
+        logger.warning(f"Status LED on GPIO{pin} unavailable ({e}); running without it")
+        return _NullLED()
+
+
+led_red = _make_led(25)
+led_grn = _make_led(20)
+led_blu = _make_led(24)
+led_yel = _make_led(26)
+
+
+class _Flasher:
+    """Turns an LED on, then off again after a fixed delay.
+
+    Calling trigger() again before the delay elapses just restarts the
+    timer, so back-to-back messages keep the LED lit instead of flickering.
+    """
+
+    def __init__(self, led, seconds=2.0, name=""):
+        self.led = led
+        self.seconds = seconds
+        self.name = name or "led"
+        self._timer = None
+        self._lock = threading.Lock()
+
+    def trigger(self):
+        with self._lock:
+            logger.info(f"[LED] {self.name} ON for {self.seconds}s")
+            self.led.on()
+            if self._timer is not None:
+                self._timer.cancel()
+            self._timer = threading.Timer(self.seconds, self._off)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def _off(self):
+        self.led.off()
+
+
+blu_flasher = _Flasher(led_blu, seconds=2.0, name="blue/Lee(45432)")
+yel_flasher = _Flasher(led_yel, seconds=2.0, name="yellow/client(35487)")
+
+
+def mark_failed(reason=""):
+    led_grn.off()
+    led_red.on()
+    logger.error(f"[STATUS] server marked FAILED: {reason}")
+
+
+def mark_ok():
+    led_red.off()
+    led_grn.on()
+
+
+# ── Crash / hang diagnostics ──────────────────────────────────────────────
+# Anything that escapes normal handling (main thread or a background
+# thread) gets a full traceback written to master.log, plus the red LED,
+# instead of vanishing into stderr with no record.
+
+def _log_uncaught_main(exc_type, exc_value, exc_tb):
+    logger.error("UNCAUGHT EXCEPTION (main thread)", exc_info=(exc_type, exc_value, exc_tb))
+    mark_failed(f"uncaught exception: {exc_value}")
+
+
+sys.excepthook = _log_uncaught_main
+
+
+def _log_uncaught_thread(args):
+    logger.error(
+        f"UNCAUGHT EXCEPTION in thread '{args.thread.name}'",
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback)
+    )
+    mark_failed(f"exception in thread {args.thread.name}: {args.exc_value}")
+
+
+threading.excepthook = _log_uncaught_thread
 
 
 # Status codes
@@ -707,6 +809,7 @@ class WoodshopServer:
 
     def handle_client(self, client_socket, client_address):
         try:
+            client_socket.settimeout(10.0)  # never block a thread forever on a stalled client
             data = b''
             while len(data) < BinaryMessage.SIZE:
                 chunk = client_socket.recv(BinaryMessage.SIZE - len(data))
@@ -717,6 +820,7 @@ class WoodshopServer:
             if len(data) == BinaryMessage.SIZE:
                 msg = BinaryMessage.from_bytes(data)
                 logger.info(f"From {client_address[0]}: {msg}")
+                yel_flasher.trigger()
                 status_code = self.process_message(msg)
                 response = BinaryMessage.create_response(
                     msg.machine_number, msg.member_id, status_code,
@@ -864,6 +968,7 @@ class LoginListener:
 
     def handle_client(self, client_socket, client_address):
         try:
+            client_socket.settimeout(10.0)  # never block a thread forever on a stalled client
             data = b''
             while len(data) < self.MSG_SIZE:
                 chunk = client_socket.recv(self.MSG_SIZE - len(data))
@@ -876,6 +981,7 @@ class LoginListener:
                                f"{client_address} ({len(data)}/{self.MSG_SIZE} bytes)")
                 return
 
+            blu_flasher.trigger()
             self.process_message(data, client_address)
         except Exception as e:
             logger.error(f"Login listener error handling {client_address}: {e}")
@@ -925,18 +1031,55 @@ class LoginListener:
         logger.info("Login listener stopped")
 
 
+_shutdown = threading.Event()
+
+
+def _handle_signal(signum, frame):
+    _shutdown.set()
+
+
 def main():
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
     logger.info("Starting Woodshop Master Server...")
     server = WoodshopServer(host='0.0.0.0', port=35487)
     login_listener = LoginListener(server.database, host='0.0.0.0', port=45432)
-    login_thread = threading.Thread(target=login_listener.start, daemon=True)
+
+    login_thread  = threading.Thread(target=login_listener.start, daemon=True)
+    server_thread = threading.Thread(target=server.start, daemon=True)
     login_thread.start()
+    server_thread.start()
+
+    # Give both listeners a moment to bind before declaring health.
+    time.sleep(1.0)
+
+    tick = 0
     try:
-        server.start()
+        while not _shutdown.is_set():
+            if server_thread.is_alive() and login_thread.is_alive():
+                mark_ok()
+            else:
+                mark_failed("a listener thread has stopped")
+
+            # Heartbeat every ~60s: if the server locks up later, this
+            # trail shows whether thread count was climbing beforehand
+            # (e.g. stalled clients piling up) versus a clean, sudden stop.
+            tick += 1
+            if tick % 60 == 0:
+                logger.info(f"[HEARTBEAT] alive threads={threading.active_count()}")
+
+            _shutdown.wait(1.0)
     except KeyboardInterrupt:
-        logger.info("\nShutting down...")
+        pass
+    finally:
+        logger.info("Shutting down...")
         login_listener.stop()
         server.stop()
+        led_red.off()
+        led_grn.off()
+        led_blu.off()
+        led_yel.off()
 
 
 if __name__ == "__main__":
