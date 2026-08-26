@@ -20,6 +20,7 @@ import socket
 import struct
 import subprocess
 import threading
+import logging
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import (Flask, render_template_string, request, redirect,
@@ -34,6 +35,24 @@ MACHINES_FILE  = os.path.join(BASE_DIR, "data", "machines.json")
 ACTIVE_FILE    = os.path.join(BASE_DIR, "data", "active_sessions.json")  # legacy, unused since Aug 2026
 ADMIN_CREDS    = os.path.join(BASE_DIR, "data", "admin_creds.json")
 DB_PATH        = os.path.join(BASE_DIR, "woodshop.db")  # written by master_server.py
+MASTER_LOG_FILE = os.path.join(BASE_DIR, "master.log")  # shared with master_server.py's log
+
+# Root logging config -- mirrors master_server.py's setup. Without this,
+# nothing had ever called logging.basicConfig() in this file, so INFO-level
+# calls (e.g. the Status LED init messages below) were silently dropped by
+# Python's default "no handler configured" behavior -- only WARNING+ was
+# reaching journalctl, via the built-in handler-of-last-resort. That's why
+# the GPIO27 "initialized OK" line never showed up even though the LED
+# itself was working fine.
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(MASTER_LOG_FILE),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # ── Membership settings ───────────────────────────────────────────────────────
 MEMBERSHIP_GRACE_DAYS   = 90   # Days after Dec 31 before access is cut off (default: 90 = April 1)
@@ -1623,44 +1642,66 @@ FIRMWARE_BIN = "firmware.bin"   # single compiled image; see /firmware/manifest.
 # (woodshop-tcp.service) — the two run as separate systemd services, so
 # each owns only the GPIO pins it lights.
 # Lit for as long as at least one node is actively downloading firmware.bin
-# via firmware_file() below; a counter (not a plain on/off) so one node
-# finishing its download doesn't turn the LED off while another is still
-# mid-transfer.
+# via firmware_file() below. Tracked with a set of per-download tokens
+# (not a plain on/off, and not a bare counter) for two reasons: (1) one
+# node finishing its download shouldn't turn the LED off while another is
+# still mid-transfer, and (2) each token also gets a failsafe expiry --
+# see _DOWNLOAD_FAILSAFE_SECONDS below.
 class _NullLED:
     def on(self):  pass
     def off(self): pass
 
 
 def _make_led(pin):
-    import logging as _led_logging  # local import: this runs at module load,
-    # before the `_logging` alias further down in this file is set up
     try:
         from gpiozero import LED
         led = LED(pin)
-        _led_logging.getLogger(__name__).info(f"Status LED on GPIO{pin} initialized OK")
+        logger.info(f"Status LED on GPIO{pin} initialized OK")
         return led
     except Exception as e:
-        _led_logging.getLogger(__name__).warning(f"Status LED on GPIO{pin} unavailable ({e}); running without it")
+        logger.warning(f"Status LED on GPIO{pin} unavailable ({e}); running without it")
         return _NullLED()
 
 
 led_wht = _make_led(27)
 _download_lock = threading.Lock()
-_active_downloads = 0
+_active_downloads = set()  # tokens (one per in-flight download)
+
+# A real firmware.bin (a few hundred KB to a couple MB) shouldn't take
+# anywhere near this long even over a weak/lossy WiFi link. This is a
+# safety net, not the normal path: the normal path is Flask calling our
+# response.call_on_close() callback the moment the transfer ends. But if a
+# node reboots mid-download, a cable/WiFi drop kills the connection, or any
+# other edge case keeps that callback from firing, the token would
+# otherwise sit in _active_downloads forever and leave the white LED stuck
+# on until the next service restart (this is what happened during initial
+# testing 2026-08-26). This timer guarantees it clears within 5 minutes
+# regardless of what happened to the connection.
+_DOWNLOAD_FAILSAFE_SECONDS = 300.0
 
 
 def _download_started():
-    global _active_downloads
+    """Register a new in-flight download and turn the LED on. Returns a
+    token that must be passed to _download_finished() when the transfer
+    ends (normally) or that the failsafe timer will pass on its own."""
+    token = object()
     with _download_lock:
-        _active_downloads += 1
+        _active_downloads.add(token)
         led_wht.on()
+    timer = threading.Timer(_DOWNLOAD_FAILSAFE_SECONDS, _download_finished, args=(token,))
+    timer.daemon = True
+    timer.start()
+    return token
 
 
-def _download_finished():
-    global _active_downloads
+def _download_finished(token):
+    """Clear one download's token. Safe to call more than once for the
+    same token (e.g. once from call_on_close, once from the failsafe timer
+    if it fires right on the boundary) -- set.discard() is a no-op if the
+    token is already gone."""
     with _download_lock:
-        _active_downloads = max(0, _active_downloads - 1)
-        if _active_downloads == 0:
+        _active_downloads.discard(token)
+        if not _active_downloads:
             led_wht.off()
 
 
@@ -1731,14 +1772,17 @@ def firmware_file(filename):
 
     Lights led_wht for the duration of the transfer (see _download_started/
     _download_finished above) — this is the actual point a node is pulling
-    bytes, as opposed to just checking /firmware/manifest.json."""
+    bytes, as opposed to just checking /firmware/manifest.json. The normal
+    path is call_on_close() firing when the transfer ends; the failsafe
+    timer started inside _download_started() is the backstop if it doesn't
+    (aborted connection, node reboot mid-download, etc.)."""
     from flask import send_from_directory, abort
     # Prevent path traversal
     if ".." in filename or filename.startswith("/"):
         abort(400)
-    _download_started()
+    token = _download_started()
     response = send_from_directory(FIRMWARE_DIR, filename)
-    response.call_on_close(_download_finished)
+    response.call_on_close(lambda: _download_finished(token))
     return response
 
 
@@ -1770,7 +1814,7 @@ def firmware_file(filename):
 
 DIAG_DIR              = os.path.join(BASE_DIR, "data", "diag")
 DIAG_KEEP_PER_MACHINE  = 200
-MASTER_LOG_FILE        = os.path.join(BASE_DIR, 'master.log')
+# MASTER_LOG_FILE now defined up top, alongside the root logging.basicConfig() call
 
 def _diag_log_path(machine_num) -> str:
     return os.path.join(DIAG_DIR, f"diag_machine_{machine_num}.jsonl")
