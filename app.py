@@ -1615,6 +1615,55 @@ FIRMWARE_DIR = os.path.join(BASE_DIR, "firmware")
 FIRMWARE_BIN = "firmware.bin"   # single compiled image; see /firmware/manifest.json
 
 
+# ── Status LED (white / GPIO27) ───────────────────────────────────────────────
+# Same driver board as master_server.py's red/grn/blu/yel LEDs (GPIO27 was
+# listed there as "unused" — this is that pin). Lives here rather than in
+# master_server.py because the actual firmware download is an HTTP GET
+# served by this process (woodshop.service), not the TCP listener
+# (woodshop-tcp.service) — the two run as separate systemd services, so
+# each owns only the GPIO pins it lights.
+# Lit for as long as at least one node is actively downloading firmware.bin
+# via firmware_file() below; a counter (not a plain on/off) so one node
+# finishing its download doesn't turn the LED off while another is still
+# mid-transfer.
+class _NullLED:
+    def on(self):  pass
+    def off(self): pass
+
+
+def _make_led(pin):
+    import logging as _led_logging  # local import: this runs at module load,
+    # before the `_logging` alias further down in this file is set up
+    try:
+        from gpiozero import LED
+        led = LED(pin)
+        _led_logging.getLogger(__name__).info(f"Status LED on GPIO{pin} initialized OK")
+        return led
+    except Exception as e:
+        _led_logging.getLogger(__name__).warning(f"Status LED on GPIO{pin} unavailable ({e}); running without it")
+        return _NullLED()
+
+
+led_wht = _make_led(27)
+_download_lock = threading.Lock()
+_active_downloads = 0
+
+
+def _download_started():
+    global _active_downloads
+    with _download_lock:
+        _active_downloads += 1
+        led_wht.on()
+
+
+def _download_finished():
+    global _active_downloads
+    with _download_lock:
+        _active_downloads = max(0, _active_downloads - 1)
+        if _active_downloads == 0:
+            led_wht.off()
+
+
 # ── OTA Firmware endpoints ────────────────────────────────────────────────────
 # Aug 2026: the client rewrote from ESP32-C3/MicroPython (many loose .py
 # source files, patched individually) to ESP32/C (one compiled binary,
@@ -1678,12 +1727,19 @@ def firmware_manifest():
 
 @app.route("/firmware/<path:filename>")
 def firmware_file(filename):
-    """Serve a firmware file for OTA download (firmware.bin, in practice)."""
+    """Serve a firmware file for OTA download (firmware.bin, in practice).
+
+    Lights led_wht for the duration of the transfer (see _download_started/
+    _download_finished above) — this is the actual point a node is pulling
+    bytes, as opposed to just checking /firmware/manifest.json."""
     from flask import send_from_directory, abort
     # Prevent path traversal
     if ".." in filename or filename.startswith("/"):
         abort(400)
-    return send_from_directory(FIRMWARE_DIR, filename)
+    _download_started()
+    response = send_from_directory(FIRMWARE_DIR, filename)
+    response.call_on_close(_download_finished)
+    return response
 
 
 # ── Diagnostics (diag.h / diag.cpp on the client, Aug 2026) ──────────────────

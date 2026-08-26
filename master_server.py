@@ -65,9 +65,14 @@ logger = logging.getLogger(__name__)
 # Wired through a driver board on the Pi's GPIO header:
 #   GPIO25 (red) - lit while the server is inoperable
 #   GPIO20 (grn) - lit while the server is running normally
-#   GPIO24 (blu) - flashes 2s on a message from Lee's machine (port 45432)
-#   GPIO26 (yel) - flashes 2s on a message from a machine controller (port 35487)
-#   GPIO27 (wht) - unused
+#   GPIO5  (blu) - flashes 1s on a message from Lee's machine (port 45432)
+#                  (moved off GPIO24 2026-08-26 to test whether dimming on
+#                  the yellow channel is tied to that specific ULN2803
+#                  channel pairing -- see master.log discussion)
+#   GPIO26 (yel) - flashes 1s on a message from a machine controller (port 35487)
+#   GPIO27 (wht) - lit while a node is downloading firmware.bin; owned and
+#                  driven by app.py (woodshop.service), not this file —
+#                  see FIRMWARE_DIR / firmware_file() there
 #
 # LED setup is defensive: if gpiozero or its pin backend isn't available
 # (e.g. missing python3-lgpio, or a udev permission issue), the server logs
@@ -90,7 +95,7 @@ def _make_led(pin):
 
 led_red = _make_led(25)
 led_grn = _make_led(20)
-led_blu = _make_led(24)
+led_blu = _make_led(5)
 led_yel = _make_led(26)
 
 
@@ -122,8 +127,8 @@ class _Flasher:
         self.led.off()
 
 
-blu_flasher = _Flasher(led_blu, seconds=2.0, name="blue/Lee(45432)")
-yel_flasher = _Flasher(led_yel, seconds=2.0, name="yellow/client(35487)")
+blu_flasher = _Flasher(led_blu, seconds=1.0, name="blue/Lee(45432)")
+yel_flasher = _Flasher(led_yel, seconds=1.0, name="yellow/client(35487)")
 
 
 def mark_failed(reason=""):
@@ -170,14 +175,23 @@ STATUS_MEMBER_NOT_AUTHORIZED = 0x0004
 STATUS_INVALID_MESSAGE     = 0x0005
 
 # ── OTA update flag ───────────────────────────────────────────────────────────
-# Set True to signal all nodes to download a software update on next boot.
-# Nodes store this in NVS when received; OTA runs at start of next boot cycle.
+# Set True to signal all nodes a software update is available. Nodes are
+# ESP32/C (compiled binary, flashed into the inactive OTA partition) as of
+# Aug 2026 — see app.py's "OTA Firmware endpoints" comment block for the
+# full explanation and the firmware.bin/manifest.json side of this.
 # Workflow:
-#   1. Copy updated .py files to the woodshop firmware/ directory
-#   2. Set UPDATE_AVAILABLE = True and restart: sudo systemctl restart woodshop-tcp
-#   3. Each node picks up the flag on its next card event and stores it in NVS
-#   4. On next reboot the node downloads changed files and clears the flag
-#   5. Set UPDATE_AVAILABLE = False and restart again once all nodes updated
+#   1. Stage firmware.bin + version.txt in the woodshop firmware/ directory
+#      (see app.py's OTA Firmware endpoints section for exact steps)
+#   2. python3 set_ota.py true   (sets UPDATE_AVAILABLE = True below and
+#      restarts woodshop-tcp for you)
+#   3. Each node picks up update_available=1 on its next card event (fast
+#      path) or its next periodic self-check (idle nodes, every 10 min —
+#      see OTA_CHECK_INTERVAL_MS on the client)
+#   4. Node fetches manifest.json, compares versions, downloads+flashes in
+#      the background if different, and reboots once no card session is
+#      open. Nodes already on the new version compare equal and skip
+#      re-flashing, so this flag can safely stay True through a rollout.
+#   5. python3 set_ota.py false once all nodes have updated (not urgent)
 #UPDATE_AVAILABLE = False   <-- placed at top of file
 
 
