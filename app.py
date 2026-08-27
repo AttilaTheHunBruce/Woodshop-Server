@@ -1869,6 +1869,22 @@ def _ingest_one_diag_report(data: dict) -> bool:
     with open(path, "w") as f:
         f.writelines(lines)
 
+    # ota_task.cpp's _report_ota_failure() posts a different shape than a
+    # boot/crash report -- {"machine", "event":"ota_failed", "reason",
+    # "target_version", "fw_version"} -- since a failed-but-non-crashing
+    # download never resets the board, so there's no reset_reason/boot_num/
+    # RTC breadcrumb to report. Give it its own log line instead of running
+    # it through the BOOT/RESTART template, where those fields would just
+    # show up as "?" and read as a malformed boot report rather than what it
+    # actually is.
+    if data.get("event") == "ota_failed":
+        summary = (f"machine={machine} reason={data.get('reason','?')} "
+                    f"target_version={data.get('target_version','?')} "
+                    f"fw_version={data.get('fw_version','?')}")
+        print(f"[diag] OTA FAILED {summary}")
+        diag_logger.info(f"OTA FAILED {summary}")
+        return True
+
     summary = (f"machine={machine} boot={data.get('boot_num','?')} "
                f"reset_reason={data.get('reset_reason','?')} "
                f"last_mark={data.get('last_mark','?')}")
