@@ -1,0 +1,15 @@
+[Unit]
+Description=Woodshop Master Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=woodshop
+WorkingDirectory=/home/woodshop/woodshop
+ExecStart=/usr/bin/authbind --deep /home/woodshop/woodshop/venv/bin/python /home/woodshop/woodshop/app.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
