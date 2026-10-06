@@ -14,3 +14,11 @@ firmware/
 # Python bytecode cache
 __pycache__/
 *.pyc
+data/
+*.db
+*.log
+access_log.csv
+venv/
+firmware/
+__pycache__/
+*.pyc
