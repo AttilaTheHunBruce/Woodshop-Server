@@ -233,22 +233,74 @@ def member_name(member_id):
     return f"Member {member_id}"
 
 
-MEMBERSHIP_GRACE_DAYS = 90   # keep in sync with app.py
-
-
 def _membership_current(user):
-    """Same rule as app.py is_membership_current(): active flag set AND
-    expiry (+ grace days) not passed. No expiry on file = current."""
-    if not user.get('active', True):
+    """Eligibility is decided by Login (Lee's kiosk): it only sends a message
+    for a member who is entitled to be in the shop, so no expiry / grace-period
+    test is done here. The only local rule is the optional admin block: a
+    record whose 'active' flag was explicitly set to False on the Users page
+    gets no machine permissions."""
+    return user.get('active', True) is not False
+
+
+NEW_MEMBER_PERMISSIONS = '1' * 128     # full access, all 128 machine positions
+_users_lock = threading.Lock()
+
+
+def ensure_member(member_id, first_name, last_name):
+    """
+    Every message from Login is assumed to be for a valid member. If
+    member_id is not in users.json, append a record with the names from the
+    message and FULL access to all 128 machines (permission string of 128 '1').
+    An existing record is never modified (so permissions limited on the web
+    page are kept). Returns True if a record was added.
+
+    Safety: a missing file starts a new list, but a file that exists and
+    cannot be parsed is left alone (logged, nothing written) so a bad read
+    can never wipe the member list. The write is atomic (temp file +
+    os.replace).
+    """
+    if not member_id:
         return False
-    expiry_str = user.get('expiry', '')
-    if not expiry_str:
-        return True
-    try:
-        expiry = datetime.strptime(expiry_str, '%Y-%m-%d')
-        return datetime.now() <= expiry + timedelta(days=MEMBERSHIP_GRACE_DAYS)
-    except ValueError:
-        return True
+    mid = str(member_id)
+    with _users_lock:
+        try:
+            if os.path.exists(USERS_FILE):
+                with open(USERS_FILE) as f:
+                    users = json.load(f)
+                if not isinstance(users, list):
+                    raise ValueError("users.json is not a list")
+            else:
+                users = []
+        except Exception as e:
+            logger.error(f"[ENROLL] cannot read {USERS_FILE} ({e}); "
+                         f"member {member_id} NOT added")
+            return False
+        if any(str(u.get('id', '')) == mid for u in users):
+            return False
+        users.append({
+            'id':          member_id,
+            'first_name':  first_name,
+            'last_name':   last_name,
+            'email':       '',
+            'phone':       '',
+            'rfid':        '',
+            'joined':      datetime.now().strftime('%Y-%m-%d'),
+            'expiry':      '',
+            'active':      True,
+            'permissions': NEW_MEMBER_PERMISSIONS,
+        })
+        try:
+            os.makedirs(os.path.dirname(USERS_FILE), exist_ok=True)
+            tmp = USERS_FILE + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump(users, f, indent=2)
+            os.replace(tmp, USERS_FILE)
+        except Exception as e:
+            logger.error(f"[ENROLL] could not write {USERS_FILE}: {e}")
+            return False
+    logger.info(f"[ENROLL] new member {member_id} ({first_name} {last_name}) "
+                f"added to users.json with full access (128 machines)")
+    return True
 
 
 def member_permissions(member_id):
@@ -267,7 +319,7 @@ def member_permissions(member_id):
         for u in users:
             if str(u.get('id', '')) == mid:
                 if not _membership_current(u):
-                    logger.warning(f"Member {member_id} is inactive or expired -- "
+                    logger.warning(f"Member {member_id} is blocked (active=False) -- "
                                    f"granting NO machine permissions")
                     return ''
                 return u.get('permissions', '') or ''
@@ -585,9 +637,9 @@ class Database:
         if row is None:
             return False            # not signed in at the kiosk
         # Live lookup in the member file on every request (so permission,
-        # active-flag and expiry changes take effect immediately, not only at
+        # permission and block (active=False) changes take effect immediately, not only at
         # the member's next login). member_permissions() returns '' for an
-        # unknown, inactive or expired member.
+        # unknown or blocked member.
         permissions = member_permissions(member_id)
         if not permissions:
             return False
@@ -1014,6 +1066,10 @@ class LoginListener:
     (Supersedes an earlier 52-byte ASCII draft format -- Lee's actual
     kiosk sends the binary format above.)
 
+    Every message is assumed to be for a valid member (Login only sends
+    messages for members it has approved). A login for a member not yet in
+    users.json adds that member with full access to all 128 machines.
+
     A login message inserts/replaces a row in active_members, with
     login_time set directly from the message's own timestamp (not from
     Server's clock) and permissions looked up fresh from the reduced
@@ -1099,6 +1155,7 @@ class LoginListener:
             login_time = datetime.now()
 
         if msg_type == self.TYPE_LOGIN:
+            ensure_member(member_id, first_name, last_name)
             permissions = member_permissions(member_id)
             self.database.login_member(member_id, first_name, last_name,
                                        login_time, permissions)
