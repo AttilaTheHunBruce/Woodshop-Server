@@ -1,0 +1,16 @@
+# Local Python environment (rebuilt fresh by deploy/bootstrap.sh)
+venv/
+
+# Runtime data -- users, machines, admin creds, active sessions, diagnostics
+data/
+
+# SQLite database and logs
+*.db
+*.log
+
+# Firmware images staged for OTA -- deployed separately, not part of source
+firmware/
+
+# Python bytecode cache
+__pycache__/
+*.pyc
