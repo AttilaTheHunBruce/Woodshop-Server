@@ -322,7 +322,6 @@ NAV_AUTH = """
     <a href="/active">Active</a>
     <a href="/admin/users">Users</a>
     <a href="/admin/machines">Machines</a>
-    <a href="/admin/renew">Renew</a>
     <a href="/admin/diag">Diagnostics</a>
     <a href="/logout">Logout</a>
   </nav>
@@ -871,28 +870,15 @@ USERS_LIST_PAGE = """<!doctype html><html><head><title>All Users – Woodshop</t
       </div>
     </div>
     <div style="display:flex;gap:.5rem;margin-bottom:.8rem;flex-wrap:wrap">
-      <input id="filterInput" placeholder="Filter by name, ID, RFID…"
+      <input id="filterInput" placeholder="Filter by name or ID…"
              oninput="filterTable(this.value)"
              style="flex:1;min-width:180px;margin:0">
-      <select id="statusFilter"
-              onchange="filterTable(document.getElementById('filterInput').value)"
-              style="width:auto;margin:0">
-        <option value="">All statuses</option>
-        <option value="active">Active</option>
-        <option value="grace">Grace period</option>
-        <option value="lapsed">Lapsed</option>
-        <option value="inactive">Inactive</option>
-      </select>
     </div>
     <div style="overflow-x:auto">
       <table id="userTable">
         <thead><tr>
           <th><a class="sort-link" onclick="sortTable(0)">ID ⇅</a></th>
           <th><a class="sort-link" onclick="sortTable(1)">Name ⇅</a></th>
-          <th>Email</th>
-          <th>RFID</th>
-          <th><a class="sort-link" onclick="sortTable(4)">Expiry ⇅</a></th>
-          <th>Status</th>
           <th>Perms</th>
           <th></th>
         </tr></thead>
@@ -909,7 +895,8 @@ USERS_LIST_PAGE = """<!doctype html><html><head><title>All Users – Woodshop</t
 <script>
 function filterTable(q) {{
   q = q.toLowerCase();
-  const sf = document.getElementById('statusFilter').value;
+  const sfEl = document.getElementById('statusFilter');
+  const sf = sfEl ? sfEl.value : '';
   let vis = 0;
   document.querySelectorAll('#userTable tbody tr').forEach(row => {{
     const show = (!q || row.textContent.toLowerCase().includes(q))
@@ -974,20 +961,14 @@ def admin_users_list():
     for u in users_sorted:
         uid    = u.get('id','')
         name   = f"{u.get('first_name','')} {u.get('last_name','')}".strip()
-        email  = u.get('email','')
-        rfid   = u.get('rfid','')
-        expiry = u.get('expiry','')
-        css, label = _renew_status(u)
+        blocked_tag = (" <span class='status-lapsed'>(blocked)</span>"
+                       if u.get('active', True) is False else "")
         perm_bits  = _perms_to_list(u.get('permissions',''))
         perm_count = sum(perm_bits[:NUM_MACHINES])
         rows_html += (
-            f'<tr data-status="{css}">'
+            f'<tr>'
             f'<td>{uid}</td>'
-            f'<td>{name}</td>'
-            f'<td style="font-size:.8rem">{email}</td>'
-            f'<td style="font-family:monospace;font-size:.8rem">{rfid}</td>'
-            f'<td style="font-size:.8rem">{expiry}</td>'
-            f'<td><span class="status-{css}">{label}</span></td>'
+            f'<td>{name}{blocked_tag}</td>'
             f'<td style="font-size:.8rem;white-space:nowrap">{perm_count}/{NUM_MACHINES}</td>'
             f'<td style="white-space:nowrap">'
             f'<a href="/admin/users/edit?uid={uid}" class="btn btn-sm">Edit</a> '
@@ -1159,34 +1140,22 @@ def _build_edit_page(user: dict, machines: list[dict],
       </div>
 
       <div style="display:flex;gap:.8rem;flex-wrap:wrap">
-        <div style="flex:1;min-width:160px">
-          <label>Email</label>
-          <input name="email" value="{user.get('email','')}" placeholder="member@example.com">
-        </div>
-        <div style="flex:1;min-width:160px">
-          <label>Phone</label>
-          <input name="phone" value="{user.get('phone','')}">
-        </div>
+        <input type="hidden" name="email" value="{user.get('email','')}">
+        <input type="hidden" name="phone" value="{user.get('phone','')}">
       </div>
 
       <div style="display:flex;gap:.8rem;flex-wrap:wrap">
-        <div style="flex:1;min-width:160px">
-          <label>RFID UID (hex)</label>
-          <input name="rfid" value="{user.get('rfid', rfid)}" placeholder="04994E2A737A80">
-        </div>
+        <input type="hidden" name="rfid" value="{user.get('rfid', rfid)}">
         <div style="flex:1;min-width:120px">
           <label>Joined (YYYY-MM-DD)</label>
           <input name="joined" value="{user.get('joined','')}" placeholder="2026-01-01">
         </div>
-        <div style="flex:1;min-width:120px">
-          <label>Expiry (YYYY-MM-DD)</label>
-          <input name="expiry" value="{user.get('expiry', default_expiry_date())}" placeholder="2026-12-31">
-        </div>
+        <input type="hidden" name="expiry" value="{user.get('expiry', '')}">
         <div style="flex:0;min-width:100px">
           <label>Active</label>
           <select name="active" style="width:auto">
             <option value="true"  {'selected' if user.get('active', True) else ''}>Yes</option>
-            <option value="false" {'selected' if not user.get('active', True) else ''}>No</option>
+            <option value="false" {'selected' if not user.get('active', True) else ''}>No (blocked)</option>
           </select>
         </div>
       </div>
