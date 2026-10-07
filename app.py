@@ -2303,7 +2303,8 @@ ADMIN_CARD_PAGE = """<!doctype html><html><head><title>Admin Card – Woodshop</
       Sets a machine's number and blast-gate run-on delay. Put a blank card on the
       reader, click Write, and keep it there until the result appears (about
       {wait} seconds maximum). Then hold the card to the machine's reader when no
-      member is using it. Existing member cards are not overwritten.
+      member is using it. A card that holds a member card is not overwritten
+      unless you tick the box below.
     </p>
     <label>Machine</label>
     <select id="pick" onchange="pickMachine()">
@@ -2324,6 +2325,10 @@ ADMIN_CARD_PAGE = """<!doctype html><html><head><title>Admin Card – Woodshop</
         <select id="blast">{blast_options}</select>
       </div>
     </div>
+    <label style="display:flex;align-items:center;gap:.5rem;margin-top:.8rem;font-weight:normal">
+      <input id="force" type="checkbox" style="width:auto;margin:0">
+      Overwrite a card that holds a member card (erases that member's card)
+    </label>
     <div style="display:flex;gap:.6rem;margin-top:.8rem;flex-wrap:wrap">
       <button type="button" class="btn" onclick="doCard('write')">Write card</button>
       <button type="button" class="btn" style="background:#333;color:var(--text)"
@@ -2346,11 +2351,14 @@ function show(cls, html) {{
 }}
 function esc(t) {{ const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }}
 function doCard(action) {{
+  const force = action === 'write' && document.getElementById('force').checked;
+  if (force && !confirm('This will erase any member card data on the card you put on the reader. Continue?')) return;
   const body = new URLSearchParams({{
     action: action,
     machine: document.getElementById('machine').value,
     name: document.getElementById('name').value,
-    blast: document.getElementById('blast').value
+    blast: document.getElementById('blast').value,
+    force: force ? '1' : ''
   }});
   document.querySelectorAll('.btn').forEach(b => b.disabled = true);
   show('', 'Present the card to the reader now…');
@@ -2410,6 +2418,8 @@ def admin_card_run():
             return jsonify({"ok": False, "error": "Machine number and delay must be numbers"})
         cmd += ["--machine", str(machine), "--name", f.get("name", "").strip(),
                 "--blast", str(blast)]
+        if f.get("force") == "1":
+            cmd.append("--force")
     if not os.path.exists(ADMIN_CARD_SCRIPT):
         return jsonify({"ok": False, "error": "rfid_admin_card.py is not installed on the server"})
     if not _card_lock.acquire(blocking=False):

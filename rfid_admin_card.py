@@ -18,10 +18,11 @@ Card layout (UNSIGNED, config card version 2), pages 4.. of the NTAG215:
     21..119     : zero-filled (clears whatever the card held before)
 These values match config.h (CARD_TYPE_CONFIG, CFG_*) in the client firmware.
 
-Hardware: Raspberry Pi + PN532 on SPI, same wiring as rfid_write.py:
-    SCK GPIO11, MISO GPIO9, MOSI GPIO10, SS GPIO8 (CE0), RSTO GPIO25.
-    NOTE: GPIO25 is also the server's first status LED. If both are wired,
-    move the PN532 reset with --reset-pin (or use --no-reset).
+Hardware: Raspberry Pi + PN532 on SPI (SPI must be enabled on the Pi):
+    SCK GPIO11, MISO GPIO9, MOSI GPIO10, SS GPIO22; IRQ and RSTO not connected.
+    Defaults below match that wiring. Other wiring: --cs-pin N, and
+    --reset-pin N if the module's reset input is wired. (GPIO25, the old
+    default reset pin, is also the server's first status LED.)
 
 This script is the only place that touches the reader. The server's
 "Admin Card" web page runs it with --json and shows the result, so a USB
@@ -138,7 +139,21 @@ def wait_for_card(pn532, timeout_s):
     return None
 
 
-def read_card_bytes(pn532, total_len=CARD_TOTAL_LEN):
+def uid_text(uid):
+    return " ".join(f"{b:02X}" for b in uid)
+
+
+def card_hint(uid):
+    """Explain a read failure from the UID length: NTAG215 cards have a
+    7-byte UID; a 4-byte UID is a MIFARE Classic card (or similar), which the
+    machine clients cannot use either."""
+    if len(uid) == 4:
+        return ("a 4-byte UID means this is probably a MIFARE Classic card, "
+                "not an NTAG215; use NTAG215 cards")
+    return "hold the card still, flat and about 3 cm from the antenna"
+
+
+def read_card_bytes(pn532, total_len=CARD_TOTAL_LEN, uid=b""):
     data = bytearray()
     for i in range((total_len + 3) // 4):
         block = None
@@ -148,12 +163,13 @@ def read_card_bytes(pn532, total_len=CARD_TOTAL_LEN):
                 break
             time.sleep(0.05)
         if block is None:
-            return None
+            raise CardError(f"could not read page {PAGE_START + i} of the card "
+                            f"(UID {uid_text(uid)}): {card_hint(uid)}")
         data.extend(block)
     return bytes(data)
 
 
-def write_card_bytes(pn532, payload):
+def write_card_bytes(pn532, payload, uid=b""):
     for i in range((len(payload) + 3) // 4):
         chunk = payload[i * 4:i * 4 + 4].ljust(4, b"\x00")
         for _ in range(5):
@@ -162,7 +178,7 @@ def write_card_bytes(pn532, payload):
             time.sleep(0.05)
         else:
             raise CardError(f"write failed on page {PAGE_START + i} "
-                            "(hold the card still, about 3 cm from the antenna)")
+                            f"(UID {uid_text(uid)}): {card_hint(uid)}")
         time.sleep(0.01)
 
 
@@ -173,26 +189,26 @@ def do_write(args):
     if args.dry_run:
         return {"ok": True, "action": "write", "dry_run": True, **info}
     pn532 = open_reader(args.cs_pin, args.reset_pin)
-    if wait_for_card(pn532, args.timeout) is None:
+    uid = wait_for_card(pn532, args.timeout)
+    if uid is None:
         raise CardError("no card presented (timed out)")
-    existing = read_card_bytes(pn532, 8)
+    existing = read_card_bytes(pn532, 8, uid)
     if existing and is_member_card(existing) and not args.force:
         raise CardError("this card holds a member card; refusing to overwrite it "
                         "(use a blank card, or --force)")
-    write_card_bytes(pn532, payload)
-    back = read_card_bytes(pn532, USED_LEN + 3)
-    if back is None or back[:USED_LEN] != payload[:USED_LEN]:
+    write_card_bytes(pn532, payload, uid)
+    back = read_card_bytes(pn532, USED_LEN + 3, uid)
+    if back[:USED_LEN] != payload[:USED_LEN]:
         raise CardError("verify failed: the card does not hold what was written")
     return {"ok": True, "action": "write", "verified": True, **info}
 
 
 def do_read(args):
     pn532 = open_reader(args.cs_pin, args.reset_pin)
-    if wait_for_card(pn532, args.timeout) is None:
+    uid = wait_for_card(pn532, args.timeout)
+    if uid is None:
         raise CardError("no card presented (timed out)")
-    data = read_card_bytes(pn532)
-    if data is None:
-        raise CardError("could not read the card")
+    data = read_card_bytes(pn532, USED_LEN + 3, uid)   # only the first 6 pages matter
     return {"ok": True, "action": "read", **parse_payload(data)}
 
 
@@ -209,9 +225,9 @@ def main(argv=None):
     for p in (w, sub.choices["read"]):
         p.add_argument("--json", action="store_true", help="print one JSON object")
         p.add_argument("--timeout", type=float, default=20.0)
-        p.add_argument("--cs-pin", type=int, default=8, help="BCM pin of the PN532 SS (default 8)")
-        p.add_argument("--reset-pin", type=int, default=25, help="BCM pin of PN532 RSTO (default 25)")
-        p.add_argument("--no-reset", action="store_true", help="PN532 reset line not wired")
+        p.add_argument("--cs-pin", type=int, default=22, help="BCM pin of the PN532 SS (default 22)")
+        p.add_argument("--reset-pin", type=int, default=None, help="BCM pin of the PN532 reset input (default: not wired)")
+        p.add_argument("--no-reset", action="store_true", help="(kept for compatibility; reset is not used by default)")
     args = ap.parse_args(argv)
     if args.no_reset:
         args.reset_pin = None

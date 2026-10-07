@@ -196,22 +196,37 @@ STATUS_INVALID_MESSAGE     = 0x0005
 
 
 
-# Machine number -> name. Zero-based; must match the numbering used by the
-# machine controllers' DIP switches (and by data/machines.json in app.py).
-MACHINES = {
-     0: "Table Saw",
-     1: "Band Saw",
-     2: "Lathe",
-     3: "Planer",
-     4: "Jointer",
-     5: "Router Table",
-     6: "Drill Press",
-     7: "Scroll Saw",
-    31: "Admin Override",
-}
+# Machine number -> name. Names come from data/machines.json (the list edited
+# on the web app's Machines page and used by the Admin Card page), looked up by
+# machine number = the "id" there. Machine numbers are 1-based, the same
+# numbering as the permission bits (bit 0 = machine 1) and the admin card.
+# A number with no entry shows as "Machine N". The file is re-read whenever it
+# changes, so renaming a machine on the web page takes effect immediately.
+MACHINES_FILE = os.path.join(BASE_DIR, 'data', 'machines.json')
+_machine_names = {}
+_machine_names_mtime = None
+
 
 def machine_name(num):
-    return MACHINES.get(num, f"Machine {num}")
+    global _machine_names, _machine_names_mtime
+    try:
+        mtime = os.path.getmtime(MACHINES_FILE)
+    except OSError:
+        mtime = None
+    if mtime != _machine_names_mtime:
+        names = {}
+        try:
+            with open(MACHINES_FILE) as f:
+                for m in json.load(f):
+                    try:
+                        names[int(m.get('id'))] = str(m.get('name', '')).strip()
+                    except (TypeError, ValueError):
+                        pass
+        except (OSError, ValueError):
+            pass
+        _machine_names, _machine_names_mtime = names, mtime
+    return _machine_names.get(num) or f"Machine {num}"
+
 
 USERS_FILE   = os.path.join(BASE_DIR, 'data', 'users.json')
 CSV_LOG_FILE = os.path.join(BASE_DIR, 'data', 'access_log.csv')
