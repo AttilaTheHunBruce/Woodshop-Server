@@ -19,6 +19,7 @@ import secrets
 import socket
 import struct
 import subprocess
+import sys
 import threading
 import logging
 from datetime import datetime, timedelta
@@ -322,6 +323,7 @@ NAV_AUTH = """
     <a href="/active">Active</a>
     <a href="/admin/users">Users</a>
     <a href="/admin/machines">Machines</a>
+    <a href="/admin/card">Admin Card</a>
     <a href="/admin/diag">Diagnostics</a>
     <a href="/logout">Logout</a>
   </nav>
@@ -2278,6 +2280,155 @@ def api_machines_import():
         return _j({"ok": True, "message": f"Imported {len(new_machines)} machine(s) successfully."})
     except Exception as e:
         return _j({"ok": False, "error": str(e)})
+
+
+# ── Admin: machine admin card (read / write) ────────────────────────────────
+# Writes/reads the NTAG215 "admin card" that sets a machine client's machine
+# number and blast-gate delay (and carries a machine name). All reader access
+# is done by rfid_admin_card.py, run as a subprocess with --json, so this web
+# app imports no hardware libraries and the reader (PN532 on SPI today, a USB
+# reader/writer later) can be swapped by replacing that script alone.
+
+ADMIN_CARD_SCRIPT = os.path.join(BASE_DIR, "rfid_admin_card.py")
+_card_lock = threading.Lock()          # one reader operation at a time
+CARD_WAIT_S = 20                       # how long the script waits for a card
+
+ADMIN_CARD_PAGE = """<!doctype html><html><head><title>Admin Card – Woodshop</title>
+{style}</head><body>
+{nav}
+<div class="container" style="max-width:560px">
+  <div class="card">
+    <h2>Machine Admin Card</h2>
+    <p style="color:var(--muted);font-size:.85rem;margin-top:0">
+      Sets a machine's number and blast-gate run-on delay. Put a blank card on the
+      reader, click Write, and keep it there until the result appears (about
+      {wait} seconds maximum). Then hold the card to the machine's reader when no
+      member is using it. Existing member cards are not overwritten.
+    </p>
+    <label>Machine</label>
+    <select id="pick" onchange="pickMachine()">
+      <option value="">— choose from the Machines list, or type below —</option>
+      {options}
+    </select>
+    <div style="display:flex;gap:.8rem;flex-wrap:wrap">
+      <div style="flex:1;min-width:110px">
+        <label>Machine number (1–128)</label>
+        <input id="machine" type="number" min="1" max="128">
+      </div>
+      <div style="flex:2;min-width:180px">
+        <label>Machine name (16 characters max)</label>
+        <input id="name" maxlength="16">
+      </div>
+      <div style="flex:1;min-width:130px">
+        <label>Blast gate delay</label>
+        <select id="blast">{blast_options}</select>
+      </div>
+    </div>
+    <div style="display:flex;gap:.6rem;margin-top:.8rem;flex-wrap:wrap">
+      <button type="button" class="btn" onclick="doCard('write')">Write card</button>
+      <button type="button" class="btn" style="background:#333;color:var(--text)"
+              onclick="doCard('read')">Read card</button>
+    </div>
+    <div id="result" style="margin-top:1rem"></div>
+  </div>
+</div>
+<script>
+const MACHINES = {machines_json};
+function pickMachine() {{
+  const v = document.getElementById('pick').value;
+  if (v === '') return;
+  const m = MACHINES[v];
+  document.getElementById('machine').value = m.id;
+  document.getElementById('name').value = m.name;
+}}
+function show(cls, html) {{
+  document.getElementById('result').innerHTML = '<div class="flash ' + cls + '">' + html + '</div>';
+}}
+function esc(t) {{ const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }}
+function doCard(action) {{
+  const body = new URLSearchParams({{
+    action: action,
+    machine: document.getElementById('machine').value,
+    name: document.getElementById('name').value,
+    blast: document.getElementById('blast').value
+  }});
+  document.querySelectorAll('.btn').forEach(b => b.disabled = true);
+  show('', 'Present the card to the reader now…');
+  fetch('/admin/card/run', {{method:'POST', headers:{{'Content-Type':'application/x-www-form-urlencoded'}}, body:body}})
+    .then(r => r.json())
+    .then(d => {{
+      if (d.ok) {{
+        show('', (action === 'write' ? '✔ Card written and verified. ' : '✔ Card read. ') +
+             'Machine <b>' + d.machine + '</b>, name <b>' + esc(d.name || '(none)') +
+             '</b>, blast gate delay <b>' + d.blast_s + ' s</b>.');
+        if (action === 'read') {{
+          document.getElementById('machine').value = d.machine;
+          document.getElementById('name').value = d.name;
+          document.getElementById('blast').value = d.blast_s;
+        }}
+      }} else show('error', esc(d.error || 'Unknown error'));
+    }})
+    .catch(e => show('error', 'Request failed: ' + esc(String(e))))
+    .finally(() => document.querySelectorAll('.btn').forEach(b => b.disabled = false));
+}}
+</script>
+</body></html>"""
+
+
+@app.route("/admin/card", methods=["GET"])
+@login_required
+def admin_card():
+    machines = load_json(MACHINES_FILE, [])
+    machines = [m for m in machines if str(m.get("id", "")).isdigit()]
+    machines.sort(key=lambda m: int(m["id"]))
+    lite = [{"id": int(m["id"]), "name": str(m.get("name", ""))[:16]} for m in machines]
+    options = "".join(
+        f'<option value="{i}">{m["id"]} – {m["name"]}</option>' for i, m in enumerate(lite))
+    blast_options = "".join(
+        f'<option value="{sec}"{" selected" if sec == 30 else ""}>{sec} s</option>'
+        for sec in range(0, 151, 10))
+    return ADMIN_CARD_PAGE.format(
+        style=COMMON_STYLE, nav=NAV_AUTH.format(app_version=__version__),
+        options=options, blast_options=blast_options, wait=CARD_WAIT_S,
+        machines_json=json.dumps(lite).replace("</", "<\\/"))
+
+
+@app.route("/admin/card/run", methods=["POST"])
+@login_required
+def admin_card_run():
+    f = request.form
+    action = f.get("action", "")
+    if action not in ("read", "write"):
+        return jsonify({"ok": False, "error": "Unknown action"})
+    cmd = [sys.executable, ADMIN_CARD_SCRIPT, action, "--json",
+           "--timeout", str(CARD_WAIT_S)]
+    if action == "write":
+        try:
+            machine = int(f.get("machine", "").strip())
+            blast = int(f.get("blast", "30"))
+        except ValueError:
+            return jsonify({"ok": False, "error": "Machine number and delay must be numbers"})
+        cmd += ["--machine", str(machine), "--name", f.get("name", "").strip(),
+                "--blast", str(blast)]
+    if not os.path.exists(ADMIN_CARD_SCRIPT):
+        return jsonify({"ok": False, "error": "rfid_admin_card.py is not installed on the server"})
+    if not _card_lock.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "The reader is busy with another request. Try again."})
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=CARD_WAIT_S + 20)
+        try:
+            result = json.loads(proc.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            tail = (proc.stderr or proc.stdout or "no output").strip()[-300:]
+            result = {"ok": False, "error": f"Card tool failed: {tail}"}
+    except subprocess.TimeoutExpired:
+        result = {"ok": False, "error": "The card tool did not finish in time"}
+    finally:
+        _card_lock.release()
+    app.logger.info("admin card %s -> %s", action,
+                    "ok" if result.get("ok") else result.get("error"))
+    return jsonify(result)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

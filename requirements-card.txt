@@ -1,0 +1,5 @@
+# Optional: card reader support for rfid_admin_card.py (PN532 on SPI).
+# Installed by bootstrap.sh; a failure here does not stop the server install.
+# The server itself (requirements.txt) does not need these.
+adafruit-circuitpython-pn532
+Adafruit-Blinka

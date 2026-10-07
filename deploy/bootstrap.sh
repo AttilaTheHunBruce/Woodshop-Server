@@ -51,6 +51,8 @@ else
 fi
 # Needed for gpiozero to open /dev/gpiochip0 for the status LEDs.
 sudo usermod -aG gpio "${APP_USER}"
+# SPI access for the admin-card reader (rfid_admin_card.py); group may not exist.
+getent group spi >/dev/null && sudo usermod -aG spi "${APP_USER}" || true
 
 echo "==> [3/8] Fetching source (${REPO_URL}, branch ${BRANCH})..."
 if [ -d "${APP_HOME}/.git" ]; then
@@ -66,6 +68,11 @@ echo "==> [4/8] Building Python venv and installing dependencies..."
 sudo -u "${APP_USER}" python3 -m venv "${VENV}"
 sudo -u "${APP_USER}" "${VENV}/bin/pip" install --upgrade pip
 sudo -u "${APP_USER}" "${VENV}/bin/pip" install -r "${APP_HOME}/requirements.txt"
+# Card-reader libraries for the Admin Card page. Optional: warn, never fail.
+if [ -f "${APP_HOME}/requirements-card.txt" ]; then
+    sudo -u "${APP_USER}" "${VENV}/bin/pip" install -r "${APP_HOME}/requirements-card.txt" \
+        || echo "    WARNING: card reader libraries not installed -- the Admin Card page will report an error until they are (SPI must also be enabled)." >&2
+fi
 
 echo "==> [5/8] Ensuring runtime data directories exist (not tracked in git)..."
 sudo -u "${APP_USER}" mkdir -p "${APP_HOME}/data/diag" "${APP_HOME}/firmware"
