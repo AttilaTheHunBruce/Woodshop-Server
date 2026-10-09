@@ -2292,6 +2292,11 @@ def api_machines_import():
 ADMIN_CARD_SCRIPT = os.path.join(BASE_DIR, "rfid_admin_card.py")
 _card_lock = threading.Lock()          # one reader operation at a time
 CARD_WAIT_S = 20                       # how long the script waits for a card
+# This machine's PN532 has its SPI SS/CS line wired to GPIO22, not the
+# rfid_admin_card.py default of GPIO8 -- several boards are already built
+# this way. Passed through on every invocation below so the reader is
+# actually addressed on the pin it's wired to.
+ADMIN_CARD_CS_PIN = 22
 
 ADMIN_CARD_PAGE = """<!doctype html><html><head><title>Admin Card – Woodshop</title>
 {style}</head><body>
@@ -2329,12 +2334,19 @@ ADMIN_CARD_PAGE = """<!doctype html><html><head><title>Admin Card – Woodshop</
       <input id="force" type="checkbox" style="width:auto;margin:0">
       Overwrite a card that holds a member card (erases that member's card)
     </label>
+    <label style="display:flex;align-items:center;gap:.5rem;margin-top:.4rem;font-weight:normal">
+      <input id="debug" type="checkbox" style="width:auto;margin:0">
+      Debug (log pin assignments, SPI status and each connection attempt below)
+    </label>
     <div style="display:flex;gap:.6rem;margin-top:.8rem;flex-wrap:wrap">
       <button type="button" class="btn" onclick="doCard('write')">Write card</button>
       <button type="button" class="btn" style="background:#333;color:var(--text)"
               onclick="doCard('read')">Read card</button>
     </div>
     <div id="result" style="margin-top:1rem"></div>
+    <pre id="debugLog" style="display:none;margin-top:.6rem;background:#1e1e1e;
+         border:1px solid var(--border);border-radius:4px;padding:.6rem .8rem;
+         font-size:.78rem;white-space:pre-wrap;color:var(--muted)"></pre>
   </div>
 </div>
 <script>
@@ -2352,16 +2364,19 @@ function show(cls, html) {{
 function esc(t) {{ const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }}
 function doCard(action) {{
   const force = action === 'write' && document.getElementById('force').checked;
+  const debug = document.getElementById('debug').checked;
   if (force && !confirm('This will erase any member card data on the card you put on the reader. Continue?')) return;
   const body = new URLSearchParams({{
     action: action,
     machine: document.getElementById('machine').value,
     name: document.getElementById('name').value,
     blast: document.getElementById('blast').value,
-    force: force ? '1' : ''
+    force: force ? '1' : '',
+    debug: debug ? '1' : ''
   }});
   document.querySelectorAll('.btn').forEach(b => b.disabled = true);
   show('', 'Present the card to the reader now…');
+  document.getElementById('debugLog').style.display = 'none';
   fetch('/admin/card/run', {{method:'POST', headers:{{'Content-Type':'application/x-www-form-urlencoded'}}, body:body}})
     .then(r => r.json())
     .then(d => {{
@@ -2375,6 +2390,11 @@ function doCard(action) {{
           document.getElementById('blast').value = d.blast_s;
         }}
       }} else show('error', esc(d.error || 'Unknown error'));
+      if (d.debug_log && d.debug_log.length) {{
+        const el = document.getElementById('debugLog');
+        el.textContent = d.debug_log.join('\\n');
+        el.style.display = 'block';
+      }}
     }})
     .catch(e => show('error', 'Request failed: ' + esc(String(e))))
     .finally(() => document.querySelectorAll('.btn').forEach(b => b.disabled = false));
@@ -2409,7 +2429,9 @@ def admin_card_run():
     if action not in ("read", "write"):
         return jsonify({"ok": False, "error": "Unknown action"})
     cmd = [sys.executable, ADMIN_CARD_SCRIPT, action, "--json",
-           "--timeout", str(CARD_WAIT_S)]
+           "--timeout", str(CARD_WAIT_S), "--cs-pin", str(ADMIN_CARD_CS_PIN)]
+    if f.get("debug") == "1":
+        cmd.append("--debug")
     if action == "write":
         try:
             machine = int(f.get("machine", "").strip())

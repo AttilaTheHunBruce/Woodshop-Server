@@ -19,7 +19,7 @@ Card layout (UNSIGNED, config card version 2), pages 4.. of the NTAG215:
 These values match config.h (CARD_TYPE_CONFIG, CFG_*) in the client firmware.
 
 Hardware: Raspberry Pi + PN532 on SPI (SPI must be enabled on the Pi):
-    SCK GPIO11, MISO GPIO9, MOSI GPIO10, SS GPIO22; IRQ and RSTO not connected.
+    SCK GPIO11, MISO GPIO9, MOSI GPIO10, SS GPIO8; IRQ and RSTO not connected.
     Defaults below match that wiring. Other wiring: --cs-pin N, and
     --reset-pin N if the module's reset input is wired. (GPIO25, the old
     default reset pin, is also the server's first status LED.)
@@ -36,13 +36,31 @@ Usage:
          --dry-run    (write) build and show the card, touch nothing
          --force      (write) allow overwriting a card that holds a member card
          --timeout N  seconds to wait for a card (default 20)
+         --debug      print pin assignments, /dev/spidev* presence, each
+                      connection attempt, and the PN532 library's own raw
+                      SPI frame dump -- run this directly (e.g. over SSH)
+                      when "Failed to detect the PN532" needs tracking down;
+                      the trail is also folded into the --json result as
+                      "debug_log" for when it's triggered from the web page.
 Exit status 0 = success, 1 = failure.
 """
 
 import argparse
 import json
+import os
 import sys
 import time
+
+# Collected by _dbg() regardless of --debug, so a failure's trail is always
+# available to attach to the JSON result; --debug additionally streams it
+# live to stderr as it happens.
+DEBUG_LOG = []
+
+
+def _dbg(debug, msg):
+    DEBUG_LOG.append(msg)
+    if debug:
+        print(f"DEBUG: {msg}", file=sys.stderr)
 
 CARD_TYPE_CONFIG = 0x02
 VERSION_NAMED = 0x02
@@ -112,7 +130,7 @@ def parse_payload(data):
 
 
 # ── hardware ────────────────────────────────────────────────────────────────
-def open_reader(cs_pin, reset_pin):
+def open_reader(cs_pin, reset_pin, debug=False, attempts=3):
     import board
     import busio
     import digitalio
@@ -121,13 +139,48 @@ def open_reader(cs_pin, reset_pin):
     def pin(n):
         return getattr(board, f"D{n}")
 
+    _dbg(debug, f"pins: SCK=board.SCK MOSI=board.MOSI MISO=board.MISO "
+                f"CS=board.D{cs_pin}"
+                + (f" RESET=board.D{reset_pin}" if reset_pin is not None else " RESET=not used"))
+    for dev in ("/dev/spidev0.0", "/dev/spidev0.1"):
+        _dbg(debug, f"{dev}: {'present' if os.path.exists(dev) else 'MISSING'}")
+
     spi = busio.SPI(board.SCK, board.MOSI, board.MISO)
     cs = digitalio.DigitalInOut(pin(cs_pin))
     reset = digitalio.DigitalInOut(pin(reset_pin)) if reset_pin is not None else None
-    pn532 = PN532_SPI(spi, cs, reset=reset, debug=False)
-    pn532.firmware_version          # raises if the reader does not answer
-    pn532.SAM_configuration()
-    return pn532
+
+    # Retry a few times with the chip rebuilt fresh each attempt -- a cold or
+    # just-rebooted PN532 occasionally misses the first wakeup, and this
+    # tells a one-off glitch apart from a reader that never answers at all.
+    # debug=True on PN532_SPI makes the adafruit_pn532 library itself print
+    # every raw byte it writes/reads over SPI -- the most direct evidence of
+    # whether anything is on the other end of the wire at all (all 0xFF back
+    # typically means nothing is responding -- wiring/power; a frame that's
+    # almost-but-not-quite right points more at clock speed/mode or a wrong
+    # pin than at a dead chip).
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            pn532 = PN532_SPI(spi, cs, reset=reset, debug=debug)
+            ic, ver, rev, support = pn532.firmware_version
+            _dbg(debug, f"attempt {attempt}/{attempts}: responded -- "
+                        f"IC=0x{ic:02X} firmware {ver}.{rev} support=0x{support:02X}")
+            pn532.SAM_configuration()
+            return pn532
+        except Exception as e:
+            last_err = e
+            _dbg(debug, f"attempt {attempt}/{attempts}: no response "
+                        f"({type(e).__name__}: {e})")
+            time.sleep(0.3)
+
+    _dbg(debug, "giving up -- the chip never answered GetFirmwareVersion. With "
+                 "SPI confirmed enabled and /dev/spidev* present (above), this "
+                 "points at wiring or power: re-check SCK/MOSI/MISO/CS against "
+                 "the pins noted above, confirm VCC matches what this specific "
+                 "breakout needs (3.3V vs 5V), and that RSTO/IRQ -- if wired at "
+                 "all -- aren't holding the chip in reset.")
+    raise CardError(f"could not detect the PN532 after {attempts} attempts "
+                     f"({type(last_err).__name__}: {last_err})") from last_err
 
 
 def wait_for_card(pn532, timeout_s):
@@ -188,7 +241,7 @@ def do_write(args):
     info = parse_payload(payload)
     if args.dry_run:
         return {"ok": True, "action": "write", "dry_run": True, **info}
-    pn532 = open_reader(args.cs_pin, args.reset_pin)
+    pn532 = open_reader(args.cs_pin, args.reset_pin, debug=args.debug)
     uid = wait_for_card(pn532, args.timeout)
     if uid is None:
         raise CardError("no card presented (timed out)")
@@ -204,7 +257,7 @@ def do_write(args):
 
 
 def do_read(args):
-    pn532 = open_reader(args.cs_pin, args.reset_pin)
+    pn532 = open_reader(args.cs_pin, args.reset_pin, debug=args.debug)
     uid = wait_for_card(pn532, args.timeout)
     if uid is None:
         raise CardError("no card presented (timed out)")
@@ -225,9 +278,13 @@ def main(argv=None):
     for p in (w, sub.choices["read"]):
         p.add_argument("--json", action="store_true", help="print one JSON object")
         p.add_argument("--timeout", type=float, default=20.0)
-        p.add_argument("--cs-pin", type=int, default=22, help="BCM pin of the PN532 SS (default 22)")
+        p.add_argument("--cs-pin", type=int, default=8, help="BCM pin of the PN532 SS (default 8)")
         p.add_argument("--reset-pin", type=int, default=None, help="BCM pin of the PN532 reset input (default: not wired)")
         p.add_argument("--no-reset", action="store_true", help="(kept for compatibility; reset is not used by default)")
+        p.add_argument("--debug", action="store_true",
+                       help="log pin assignments, /dev/spidev* presence, each connection "
+                            "attempt, and the PN532 library's raw SPI frames to stderr; "
+                            "also added to the --json result as \"debug_log\"")
     args = ap.parse_args(argv)
     if args.no_reset:
         args.reset_pin = None
@@ -244,6 +301,9 @@ def main(argv=None):
     except Exception as e:              # reader not wired, SPI off, etc.
         result, code = {"ok": False, "action": args.cmd,
                         "error": f"reader problem: {type(e).__name__}: {e}"}, 1
+
+    if args.debug and DEBUG_LOG:
+        result["debug_log"] = DEBUG_LOG
 
     if args.json:
         print(json.dumps(result))

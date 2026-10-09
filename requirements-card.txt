@@ -1,5 +1,8 @@
 # Optional: card reader support for rfid_admin_card.py (PN532 on SPI).
 # Installed by bootstrap.sh; a failure here does not stop the server install.
 # The server itself (requirements.txt) does not need these.
+# Blinka pulls in its own GPIO backend (RPi.GPIO on 32-bit Pi OS); compiling
+# that needs python3-dev and gcc, which bootstrap.sh installs with apt.
 adafruit-circuitpython-pn532
 Adafruit-Blinka
+spidev
